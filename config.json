@@ -1,19 +1,19 @@
 {
   "personal_info": {
-    "full_name": "John Doe",
-    "preferred_name": "John",
-    "email": "john.doe@example.com",
-    "phone": "+1-555-123-4567",
+    "full_name": "Dylan Lee",
+    "preferred_name": "Dylan",
+    "email": "dylanlee0613@gmail.com",
+    "phone": "+1-510-697-7568",
     "address": {
-      "street": "123 Main St",
-      "city": "San Jose",
+      "street": "",
+      "city": "Santa Barbara",
       "state": "CA",
-      "zip_code": "95112",
+      "zip_code": "",
       "country": "United States"
     },
-    "linkedin_url": "https://linkedin.com/in/johndoe",
-    "github_url": "https://github.com/johndoe",
-    "portfolio_url": "https://johndoe.dev",
+    "linkedin_url": "https://linkedin.com/in/dylantcl",
+    "github_url": "",
+    "portfolio_url": "https://ledlamp1256.github.io",
     "willing_to_relocate": true,
     "authorized_to_work_us": true,
     "requires_visa_sponsorship": false
@@ -21,65 +21,96 @@
 
   "work_history": [
     {
-      "job_title": "Software Engineer II",
-      "company": "Acme Corporation",
-      "location": "Remote",
-      "employment_type": "Full-time",
-      "start_date": "YYYY-MM-DD",
-      "end_date": "YYYY-MM-DD",
+      "job_title": "Counselor",
+      "company": "The Coder School Berkeley",
+      "location": "Berkeley, CA",
+      "employment_type": "Part-time",
+      "start_date": "2023-06-01",
+      "end_date": "2024-07-31",
       "is_current": false,
       "bullet_points": [
-        "Designed and shipped a microservice that reduced API latency by 35%.",
-        "Led migration of legacy monolith to containerized architecture using Docker and Kubernetes.",
-        "Mentored 3 junior engineers on code review best practices."
+        "Mentored groups of 15 students aged 6 to 12.",
+        "Taught fundamental coding skills as well as basic object-oriented programming concepts in Python, Micro:bit, and Scratch.",
+        "Developed customized lesson plans to engage students and foster critical thinking and creativity.",
+        "Managed and motivated students to create original projects while practicing core programming skills."
       ],
-      "technologies_used": ["Python", "Django", "PostgreSQL", "AWS"]
+      "technologies_used": ["Python", "Micro:bit", "Scratch"]
     },
     {
-      "job_title": "Junior Developer",
-      "company": "Startup Inc.",
-      "location": "San Jose, CA",
-      "employment_type": "Full-time",
-      "start_date": "YYYY-MM-DD",
-      "end_date": "YYYY-MM-DD",
+      "job_title": "Assistant Coach",
+      "company": "Hanabi Judo",
+      "location": "",
+      "employment_type": "Part-time",
+      "start_date": "2022-10-01",
+      "end_date": "2023-08-31",
       "is_current": false,
       "bullet_points": [
-        "Built internal dashboard tools using React and Flask.",
-        "Automated QA testing pipeline, reducing manual testing time by 20 hours/week."
+        "Taught fundamental judo techniques, creating discipline and focus.",
+        "Supported the main coach by planning and coordinating practice activities.",
+        "Provided 1-on-1 coaching to help students improve techniques."
       ],
-      "technologies_used": ["JavaScript", "React", "Flask"]
+      "technologies_used": []
     }
   ],
 
   "education": [
     {
-      "degree": "B.S. in Computer Science",
-      "institution": "State University",
-      "location": "Anytown, USA",
-      "start_date": "YYYY-MM-DD",
-      "end_date": "YYYY-MM-DD",
-      "gpa": "3.7",
+      "degree": "B.S. in Computer Engineering",
+      "institution": "University of California, Santa Barbara",
+      "location": "Santa Barbara, CA",
+      "start_date": "",
+      "end_date": "2029-06-30",
+      "gpa": "3.6",
       "gpa_scale": "4.0",
-      "relevant_coursework": ["Data Structures", "Algorithms", "Operating Systems"],
-      "honors": ["Dean's List", "Cum Laude"]
+      "relevant_coursework": [
+        "Object-Oriented Programming (C++)",
+        "Data Structures & Algorithms",
+        "Computer Organization",
+        "Foundations of Computer Science",
+        "Google AI Essentials"
+      ],
+      "honors": []
     }
   ],
 
-  "certifications": [
+  "certifications": [],
+
+  "projects": [
     {
-      "name": "AWS Certified Solutions Architect – Associate",
-      "issuing_organization": "Amazon Web Services",
-      "date_issued": "YYYY-MM-DD",
-      "expiration_date": "YYYY-MM-DD",
-      "credential_id": "ABC123XYZ"
+      "name": "AI Voice Assistant",
+      "technologies_used": ["Python", "asyncio", "Whisper", "Ollama", "Kokoro-82M"],
+      "bullet_points": [
+        "Built a local voice assistant designed to run in the background with minimal system overhead.",
+        "Offloaded speech transcription and language model tasks to the GPU to preserve CPU resources.",
+        "Implemented asynchronous task queue to decouple command processing from response generation, ensuring responsiveness and monitoring for inputs during response computing.",
+        "Integrated local inference engines to eliminate external API dependency.",
+        "Built a robust, low-overhead pipeline that handles VRAM management for system stability."
+      ]
+    },
+    {
+      "name": "Budgeting Web Application",
+      "technologies_used": ["HTML", "CSS", "JavaScript", "Firebase"],
+      "bullet_points": [
+        "Developed a budgeting web app with secure Firebase authentication and cloud data storage.",
+        "Utilized interactive pie charts to visualize income and expense categories.",
+        "Implemented secure user creation, authentication, and persistent cloud data storage, ensuring seamless data retrieval for user expense records."
+      ]
+    },
+    {
+      "name": "Google Classroom Calendar",
+      "technologies_used": ["Python", "Google Classroom API"],
+      "bullet_points": [
+        "Automated academic workflows by integrating the Google Classroom API to parse assignments into a dynamic, customizable, and color-coded calendar interface.",
+        "Developed an event creation system with date-based scheduling and local storage for persistent event saving, reuse, and effectiveness."
+      ]
     }
   ],
 
   "skills": {
-    "languages": ["Python", "JavaScript", "SQL"],
-    "frameworks_libraries": ["Django", "React", "Playwright"],
-    "tools_platforms": ["Docker", "Git", "AWS", "Ollama"],
-    "soft_skills": ["Communication", "Leadership", "Problem Solving"]
+    "languages": ["Python", "Java", "C++", "TypeScript", "JavaScript", "SQL", "HTML", "CSS"],
+    "frameworks_libraries": ["Next.js (React)", "Tailwind CSS", "Firebase"],
+    "tools_platforms": ["Git", "Ollama"],
+    "soft_skills": ["Mentoring", "Lesson Planning", "Team Coordination"]
   },
 
   "qa_bank": {
@@ -92,23 +123,23 @@
       "notes": ""
     },
     "years_of_experience": {
-      "answer": "5",
-      "notes": "Total professional software engineering experience."
+      "answer": "0-1",
+      "notes": "Currently a student; experience limited to internships, part-time roles, and personal projects."
     },
     "desired_salary": {
-      "answer": "$120,000 - $140,000",
-      "notes": "Flexible depending on total compensation package."
+      "answer": "Negotiable",
+      "notes": "Open to discussing compensation based on role and location; targeting internship-level pay."
     },
     "notice_period": {
-      "answer": "2 weeks",
-      "notes": ""
+      "answer": "Available immediately / flexible based on academic schedule",
+      "notes": "Currently enrolled at UCSB, expected graduation June 2029."
     },
     "how_did_you_hear_about_us": {
       "answer": "LinkedIn",
       "notes": "Default answer; adjust per posting if known."
     },
     "why_this_company": {
-      "answer": "I'm excited about [Company]'s mission and believe my background in backend systems and automation aligns well with your engineering team's goals.",
+      "answer": "I'm excited about [Company]'s mission and believe my background in Python, full-stack development, and building local AI-powered tools aligns well with your engineering team's goals.",
       "notes": "Generic fallback; ideally customize per application."
     },
     "are_you_over_18": {
@@ -118,6 +149,10 @@
     "criminal_record_disclosure": {
       "answer": "No",
       "notes": "Adjust truthfully as needed."
+    },
+    "currently_enrolled_student": {
+      "answer": "Yes",
+      "notes": "B.S. in Computer Engineering, UC Santa Barbara, expected graduation June 2029."
     },
     "eeo_gender": {
       "answer": "Decline to answer",
@@ -138,16 +173,21 @@
   },
 
   "documents": {
-    "resume_path": "/path/to/resume.pdf",
-    "cover_letter_template_path": "/path/to/cover_letter_template.txt",
-    "portfolio_pdf_path": "/path/to/portfolio.pdf"
+    "resume_path": "/path/to/Dylan_Lee_Engineering_Intern.pdf",
+    "cover_letter_template_path": "",
+    "portfolio_pdf_path": ""
   },
 
   "application_preferences": {
-    "job_titles_of_interest": ["Software Engineer", "Backend Developer", "Automation Engineer"],
-    "industries_of_interest": ["Technology", "Fintech", "Healthtech"],
-    "min_acceptable_salary": 100000,
-    "remote_preference": "Remote or Hybrid",
+    "job_titles_of_interest": [
+      "Software Engineering Intern",
+      "Computer Engineering Intern",
+      "Backend Developer Intern",
+      "Full-Stack Developer Intern"
+    ],
+    "industries_of_interest": ["Technology", "AI/ML", "Consumer Software"],
+    "min_acceptable_salary": null,
+    "remote_preference": "Remote, Hybrid, or On-site",
     "excluded_companies": []
   }
 }
