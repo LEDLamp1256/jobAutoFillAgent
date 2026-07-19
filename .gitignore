@@ -9,7 +9,17 @@ __pycache__/
 
 # Your local configuration (Never push your personal data!)
 config.json
+navigator_state.json
+assets/
 
 # If you create local logs or database files later
 *.log
 *.db
+applications_log.csv
+logs/
+
+# test environment/files
+test_config.json
+test_form.html
+test.html
+test.py

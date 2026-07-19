@@ -1,0 +1,15 @@
+# --- Browser automation (job_agent_scraper.py, injection_engine.py, ---
+# --- review_gate.py, main.py, job_navigator.py, test.py) ---
+playwright>=1.55.0
+
+# --- HTTP client for local Ollama API calls (ai_matcher.py, job_navigator.py) ---
+requests>=2.32.0
+
+# --- Everything else (json, csv, logging, dataclasses, argparse, re,
+#     pathlib, enum, datetime, typing, urllib.parse) is Python standard
+#     library -- no additional packages required. ---
+
+# --- Post-install steps (not pip-installable) ---
+# 1. playwright install chromium
+# 2. Install Ollama separately: https://ollama.com
+# 3. ollama pull llama3.1
