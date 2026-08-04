@@ -1,21 +1,18 @@
 """
-Responsibility of this module (and ONLY this module):
-    - Take scraped form elements (from the Playwright scraper) and the
-      user's master config.json.
-    - Send them to a local Ollama instance for field-mapping.
-    - Enforce a confidence-flag policy so low-confidence guesses never
-      get silently injected into a form.
-    - Return a clean, validated, structured dict:
+Takes scraped form elements and the user's config.json, sends them to a
+local Ollama instance for field-mapping, and enforces a confidence-flag
+policy so low-confidence guesses never get silently injected into a form.
 
-        {
-          "field_id_or_name": {
-              "value": "<text to inject, or null>",
-              "confidence": 0-100,
-              "needs_review": bool
-          },
-          ...
-        }
+Returns a validated, structured dict:
 
+    {
+      "field_id_or_name": {
+          "value": "<text to inject, or null>",
+          "confidence": 0-100,
+          "needs_review": bool
+      },
+      ...
+    }
 """
 
 from __future__ import annotations
@@ -34,33 +31,24 @@ import requests
 OLLAMA_HOST = "http://localhost:11434"
 OLLAMA_CHAT_ENDPOINT = f"{OLLAMA_HOST}/api/chat"
 
-# Any locally-pulled model works; something with decent instruction-following
-# and JSON-mode support is recommended (llama3.1, qwen2.5, mistral-nemo, etc.)
+# Any locally-pulled model with decent instruction-following and JSON-mode
+# support works (llama3.1, qwen2.5, mistral-nemo, etc.)
 MODEL_NAME = "llama3.1"
 
-# Fields below this confidence are never auto-filled; they are flagged
-# for manual review instead. Matches the "90% confidence" spec.
+# Fields below this confidence are flagged for manual review instead of
+# being auto-filled.
 CONFIDENCE_THRESHOLD = 90
 
-# Absolute path to your resume/CV file on disk. Set this to your actual
-# file before running the pipeline against a live form. Left empty by
-# default so the matcher never fabricates a path — see rule 9 below. If
-# left empty, _resolve_resume_path() falls back to whatever your own
-# config.json already has under documents.resume_path.
+# Explicit override for the resume/CV file path. Left empty by default so
+# the matcher never fabricates a path -- see rule 9 in the system prompt.
+# If empty, _resolve_resume_path() falls back to config.json's
+# documents.resume_path.
 RESUME_FILE_PATH = ""  # e.g. "/home/you/documents/resume.pdf"
 
 
 def _resolve_resume_path(config: dict[str, Any]) -> str:
-    """
-    RESUME_FILE_PATH is an explicit override; if you haven't set it, fall
-    back to whatever your own config.json already has saved under
-    documents.resume_path (or a couple of common alternate key names).
-    Forcing manual duplication of a path you've already saved once in
-    config.json is exactly the kind of thing that causes it to silently
-    stay empty and every resume field to come back null -- this is
-    reading REAL data already in your profile, not inventing anything,
-    so it doesn't weaken the "never fabricate a path" protection in rule 9.
-    """
+    """Resolve the resume path: RESUME_FILE_PATH override, else
+    config.json's documents.resume_path (or a common alternate key)."""
     if RESUME_FILE_PATH:
         return RESUME_FILE_PATH
     documents = config.get("documents", {}) if isinstance(config, dict) else {}
@@ -76,15 +64,9 @@ def _resolve_resume_path(config: dict[str, Any]) -> str:
 REQUEST_TIMEOUT_SECONDS = 90
 LLM_TEMPERATURE = 0.0  # deterministic, low-creativity matching
 
-# CRITICAL: Ollama's default context window is commonly 2048 tokens unless
-# explicitly overridden here -- and it does NOT error when a prompt exceeds
-# it, it silently truncates. A scraped form with many fields (especially
-# across multiple iframes) plus a full config.json can easily blow past
-# 2048 tokens, which produces exactly the symptom of a model "hallucinating"
-# an unrelated schema -- it's not ignoring instructions, it never saw them.
-# 16384 comfortably covers large ATS forms; raise further if you still see
-# truncation symptoms on very large pages (check the [DEBUG] token estimate
-# printed in _build_user_prompt against this number).
+# Ollama silently truncates prompts that exceed this context window rather
+# than erroring. 16384 comfortably covers most ATS forms; raise if
+# truncation symptoms appear (see the token-estimate warning below).
 OLLAMA_NUM_CTX = 16384
 
 logging.basicConfig(
@@ -121,7 +103,7 @@ class FieldMatch:
     value: Optional[str]
     confidence: int
     needs_review: bool
-    reason: Optional[str] = None  # LLM's short justification, if provided
+    reason: Optional[str] = None
 
 
 @dataclass
@@ -131,10 +113,7 @@ class MatchResult:
     raw_llm_response: Optional[str] = None
 
     def to_injection_dict(self) -> dict[str, str]:
-        """
-        Convenience accessor for Phase 4: only the fields that are safe
-        to auto-fill (i.e. passed the confidence threshold).
-        """
+        """Fields safe to auto-fill (passed the confidence threshold)."""
         return {
             fid: m.value
             for fid, m in self.matches.items()
@@ -151,11 +130,7 @@ class MatchResult:
 # --------------------------------------------------------------------------- #
 
 def _build_system_prompt() -> str:
-    """
-    Sets the LLM's role and hard rules. Kept separate from the user
-    prompt so the instructions aren't diluted by the (potentially large)
-    data payload.
-    """
+    """Builds the system prompt defining the LLM's role and hard rules."""
     return (
         "You are a precise data-mapping engine for a job application "
         "autofill tool. You are given two JSON documents: "
@@ -357,30 +332,55 @@ def _build_system_prompt() -> str:
         "trigger phrases are a strong, unambiguous signal on their own, "
         "and this rule overrides any weaker/more general inference you "
         "might otherwise make from a partial label.\n"
+        "17. ADDRESS FIELDS: before mapping ANY field whose label mentions "
+        "\"Address\", \"Street\", \"City\", \"State\", \"Province\", \"Zip\", "
+        "\"Postal Code\", or \"Country\", first SCAN THE ENTIRE form_fields "
+        "list for other address-related fields. If form_fields contains "
+        "SEPARATE fields for city/state/zip/country (even if this "
+        "particular field is just labeled \"Address\" or \"Address Line "
+        "1\" with no further qualifier), you MUST map ONLY the street/"
+        "house-number portion to it — from candidate_profile's "
+        "personal_info.address.street (or equivalent nested key) — and "
+        "map each sibling field to its own single corresponding subkey "
+        "(address.city -> the City field, address.state -> the State "
+        "field, address.zip_code -> the Zip field, address.country -> "
+        "the Country field). NEVER concatenate multiple address "
+        "components (e.g. \"123 Main St, Springfield, IL 62704\") into "
+        "ONE field when separate component fields exist elsewhere on the "
+        "same form — this breaks the form's own city/state/zip fields by "
+        "leaving them empty while overflowing the street field. Only "
+        "return a single combined full-address string for a field if "
+        "form_fields contains NO separate city/state/zip fields anywhere "
+        "at all — i.e. this is genuinely the ONLY address-related field "
+        "on the entire form.\n"
+        "18. For \"select\" or \"radio_group\" fields specifically, your "
+        "\"value\" MUST be the exact TEXT of one of the listed 'options' "
+        "— never a raw true/false boolean, even if the candidate_profile "
+        "source field is itself a boolean (e.g. willing_to_relocate: "
+        "true). Translate the boolean into whichever option text means "
+        "the same thing (e.g. true -> \"Yes\", false -> \"No\") before "
+        "writing your answer. A literal true/false value can never match "
+        "an <option> element's text and will always fail to inject even "
+        "at 100% confidence.\n"
     )
 
 
 def _build_user_prompt(form_fields: list[dict[str, Any]], config: dict[str, Any]) -> str:
     """
-    Bundles the scraped fields + candidate config into the data payload
-    the model will reason over. config is passed through exactly as loaded
-    from config.json -- no flattening -- so the model reasons over the
-    profile's natural nested structure (rule 7 in the system prompt tells
-    it to search nested objects rather than only top-level keys).
+    Bundles the scraped fields + candidate config into the payload the
+    model reasons over. config is passed through exactly as loaded from
+    config.json -- no flattening -- so the model reasons over the
+    profile's natural nested structure (see rule 7 in the system prompt).
 
-    resume_file_path is sent as a separate top-level key rather than inside
-    candidate_profile, since it's a fixed local filesystem path rather than
-    profile data -- rule 9 tells the model to source Resume/CV fields from
-    here specifically, never to fabricate a path itself.
+    resume_file_path is sent as a separate top-level key (a fixed local
+    filesystem path, not profile data) so rule 9 can source Resume/CV
+    fields from it specifically rather than the model inventing a path.
 
-    STRUCTURE: the data payload comes FIRST, and the strict output-schema
-    instruction comes LAST, as the literal final text before generation
-    starts. This matters a lot for smaller/quantized local models -- under
-    context pressure, instructions near the START of a long prompt are the
-    first thing to get "washed out" by a large data payload; instructions
-    at the END are what the model reads immediately before producing its
-    first output token. Putting the schema requirement in both the system
-    prompt (rule 2) AND here is deliberate redundancy, not duplication.
+    The data payload comes first; the strict output-schema instruction
+    comes last, immediately before generation starts, since under context
+    pressure a large data payload can wash out instructions placed early
+    in the prompt on smaller/quantized local models. The schema
+    requirement is duplicated in the system prompt (rule 2) deliberately.
     """
     resolved_resume_path = _resolve_resume_path(config)
     payload = {
@@ -391,30 +391,29 @@ def _build_user_prompt(form_fields: list[dict[str, Any]], config: dict[str, Any]
     payload_json = json.dumps(payload, indent=2, ensure_ascii=False)
     field_ids = [f["field_id"] for f in form_fields]
 
-    # --- DEBUG: confirm the exact config payload reaching the LLM ---
-    print("[DEBUG] candidate_profile sent to LLM:")
-    print(json.dumps(config, indent=2, ensure_ascii=False))
+    logger.debug("candidate_profile sent to LLM:\n%s", json.dumps(config, indent=2, ensure_ascii=False))
 
     source = "RESUME_FILE_PATH override" if RESUME_FILE_PATH else "config.documents.resume_path fallback"
-    print(f"[DEBUG] resolved resume_file_path ({source}): {resolved_resume_path!r}")
+    logger.debug("resolved resume_file_path (%s): %r", source, resolved_resume_path)
 
-    # --- DEBUG: rough size check. Ollama's context window is finite (see
-    # OLLAMA_NUM_CTX) -- if this estimate approaches or exceeds it, that's
-    # very likely why the model's output looks unrelated to the input.
+    # Rough size check -- if this approaches OLLAMA_NUM_CTX, truncation is
+    # the likely cause of an unrelated-looking model output.
     approx_chars = len(payload_json)
-    approx_tokens = approx_chars // 4  # rough chars-per-token heuristic
-    print(
-        f"[DEBUG] user prompt payload: {approx_chars} chars "
-        f"(~{approx_tokens} tokens estimated) vs OLLAMA_NUM_CTX={OLLAMA_NUM_CTX}"
+    approx_tokens = approx_chars // 4
+    logger.debug(
+        "user prompt payload: %d chars (~%d tokens estimated) vs OLLAMA_NUM_CTX=%d",
+        approx_chars, approx_tokens, OLLAMA_NUM_CTX,
     )
     if approx_tokens > OLLAMA_NUM_CTX * 0.7:
-        print(
-            f"[DEBUG] WARNING: payload is using an estimated "
-            f"{approx_tokens / OLLAMA_NUM_CTX:.0%} of the configured context "
-            f"window (including system prompt + generation headroom still "
-            f"to come) -- truncation is a real risk. Consider raising "
-            f"OLLAMA_NUM_CTX further, or batching form_fields across "
-            f"multiple smaller match_fields() calls instead of one giant one."
+        # Always surfaced (not gated behind --verbose): a real risk of
+        # silent truncation is actionable even outside verbose mode.
+        logger.warning(
+            "Prompt payload is using an estimated %.0f%% of the configured "
+            "context window (including system prompt + generation headroom "
+            "still to come) -- truncation is a real risk. Consider raising "
+            "OLLAMA_NUM_CTX further, or batching form_fields across multiple "
+            "smaller match_fields() calls instead of one giant one.",
+            approx_tokens / OLLAMA_NUM_CTX * 100,
         )
 
     return (
@@ -457,7 +456,7 @@ def _call_ollama(system_prompt: str, user_prompt: str) -> str:
             {"role": "user", "content": user_prompt},
         ],
         "stream": False,
-        "format": "json",  # ask Ollama to constrain output to valid JSON
+        "format": "json",
         "options": {
             "temperature": LLM_TEMPERATURE,
             "num_ctx": OLLAMA_NUM_CTX,
@@ -516,10 +515,7 @@ def _call_ollama(system_prompt: str, user_prompt: str) -> str:
 # --------------------------------------------------------------------------- #
 
 def _strip_code_fences(text: str) -> str:
-    """
-    Safety net: even with format="json", some models still wrap output
-    in ```json ... ``` fences. Strip them if present.
-    """
+    """Strips ```json ... ``` fences some models still emit despite format="json"."""
     text = text.strip()
     if text.startswith("```"):
         lines = text.splitlines()
@@ -532,11 +528,7 @@ def _strip_code_fences(text: str) -> str:
 
 
 def _parse_llm_json(raw_content: str) -> dict[str, Any]:
-    """
-    Parses the LLM's text output into a dict. Raises OllamaResponseError
-    with useful context on failure, rather than letting a bare
-    JSONDecodeError bubble up.
-    """
+    """Parses the LLM's text output into a dict, raising OllamaResponseError with context on failure."""
     cleaned = _strip_code_fences(raw_content)
     try:
         parsed = json.loads(cleaned)
@@ -554,38 +546,56 @@ def _parse_llm_json(raw_content: str) -> dict[str, Any]:
     return parsed
 
 
+def _normalize_boolean_to_option(value: Any, options: list[str]) -> Any:
+    """
+    Code-level fix for the LLM echoing a raw JSON boolean (e.g.
+    willing_to_relocate: true) instead of the matching option TEXT a real
+    select/radio_group actually offers (e.g. "Yes"). Only touches
+    select/radio_group/dropdown-shaped fields (options is non-empty);
+    free-text fields are untouched.
+    """
+    if not options:
+        return value
+
+    if isinstance(value, bool):
+        wants_true = value
+    elif isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        wants_true = value.strip().lower() == "true"
+    else:
+        return value
+
+    target_words = ("yes", "true") if wants_true else ("no", "false")
+    for option in options:
+        if option.strip().lower() in target_words:
+            return option
+
+    return value
+
+
 def _validate_and_build(
-    parsed: dict[str, Any], expected_field_ids: set[str]
+    parsed: dict[str, Any], expected_field_ids: set[str], field_options: dict[str, list[str]] | None = None
 ) -> dict[str, FieldMatch]:
     """
-    Cross-checks the LLM's mapping against the schema we asked for and
-    against the actual list of scraped fields, then applies the
-    confidence-threshold policy.
-
-    Any field the LLM omitted is filled in as a forced-review entry
-    rather than silently dropped -- we never want a missing field to
-    mean "safe to skip".
+    Cross-checks the LLM's mapping against the expected field schema and
+    applies the confidence-threshold policy. field_options (field_id ->
+    options list) enables boolean normalization for select/radio_group
+    fields. Any field the LLM omitted is filled in as a forced-review
+    entry rather than silently dropped.
     """
+    field_options = field_options or {}
     matches: dict[str, FieldMatch] = {}
 
-    # --- DEBUG: the decisive check -- did the LLM's response keys actually
-    # match the field_ids we asked it to map? A total flatline (every field
-    # 0%/None) almost always means this diff is non-empty on one side or
-    # the other, rather than the model "choosing" to skip obvious fields.
     received_ids = set(parsed.keys())
     missing_ids = expected_field_ids - received_ids
     extra_ids = received_ids - expected_field_ids
-    print(
-        f"[DEBUG] Expected {len(expected_field_ids)} field_id(s), "
-        f"LLM response has {len(received_ids)} top-level key(s)."
+    logger.debug(
+        "Expected %d field_id(s), LLM response has %d top-level key(s).",
+        len(expected_field_ids), len(received_ids),
     )
     if missing_ids:
-        print(f"[DEBUG] field_id(s) we asked for but got NO entry back for: {sorted(missing_ids)}")
+        logger.debug("field_id(s) we asked for but got NO entry back for: %s", sorted(missing_ids))
     if extra_ids:
-        print(f"[DEBUG] key(s) the LLM returned that we never asked about: {sorted(extra_ids)}")
-    if not missing_ids and not extra_ids:
-        print("[DEBUG] Key sets match exactly -- if values are still None/0%, the model "
-              "is choosing not to map them, not failing to see them.")
+        logger.debug("key(s) the LLM returned that we never asked about: %s", sorted(extra_ids))
 
     for field_id in expected_field_ids:
         entry = parsed.get(field_id)
@@ -608,11 +618,20 @@ def _validate_and_build(
         raw_confidence = entry.get("confidence", 0)
         reason = entry.get("reason")
 
+        options = field_options.get(field_id, [])
+        normalized_value = _normalize_boolean_to_option(value, options)
+        if normalized_value != value:
+            logger.debug(
+                "Normalized boolean value for %r: %r -> %r (matched against options %s)",
+                field_id, value, normalized_value, options,
+            )
+            value = normalized_value
+
         try:
             confidence = int(raw_confidence)
         except (TypeError, ValueError):
             confidence = 0
-        confidence = max(0, min(100, confidence))  # clamp to 0-100
+        confidence = max(0, min(100, confidence))
 
         needs_review = (value is None) or (confidence < CONFIDENCE_THRESHOLD)
 
@@ -624,7 +643,6 @@ def _validate_and_build(
             reason=reason,
         )
 
-    # Warn (but don't fail) if the LLM invented field IDs we never asked about.
     unexpected_ids = set(parsed.keys()) - expected_field_ids
     if unexpected_ids:
         logger.warning(
@@ -649,19 +667,13 @@ def match_fields(
     Main entry point for Phase 3.
 
     Args:
-        form_fields: Output of the Playwright scraper. Expected shape,
-            one dict per field, e.g.:
-                {
-                  "field_id": "input#first_name",
-                  "label": "First Name",
-                  "type": "text",
-                  "options": []            # populated for <select> fields
-                }
+        form_fields: Output of the Playwright scraper. One dict per
+            field, e.g.: {"field_id": ..., "label": ..., "type": ...,
+            "options": [...]}
         config: The parsed master config.json (candidate profile).
 
     Returns:
-        MatchResult containing per-field FieldMatch objects, split
-        between auto-fillable and needs-review via the helper methods.
+        MatchResult containing per-field FieldMatch objects.
 
     Raises:
         ValueError: if form_fields is empty or malformed.
@@ -676,9 +688,8 @@ def match_fields(
             raise ValueError(f"Form field missing required 'field_id' key: {f}")
         expected_ids.add(f["field_id"])
 
-    # --- DEBUG: confirm the exact label text reaching the matcher ---
     for f in form_fields:
-        print(f"[DEBUG] field_id={f['field_id']!r}  label={f.get('label')!r}  type={f.get('type')!r}")
+        logger.debug("field_id=%r  label=%r  type=%r", f['field_id'], f.get('label'), f.get('type'))
 
     system_prompt = _build_system_prompt()
     user_prompt = _build_user_prompt(form_fields, config)
@@ -686,12 +697,11 @@ def match_fields(
     logger.info("Sending %d field(s) to Ollama (model=%s)...", len(form_fields), MODEL_NAME)
     raw_content = _call_ollama(system_prompt, user_prompt)
 
-    # --- DEBUG: see the model's raw output before any parsing/validation ---
-    print("[DEBUG] Raw LLM response:")
-    print(raw_content)
+    logger.debug("Raw LLM response:\n%s", raw_content)
 
     parsed = _parse_llm_json(raw_content)
-    matches = _validate_and_build(parsed, expected_ids)
+    field_options = {f["field_id"]: f.get("options", []) for f in form_fields}
+    matches = _validate_and_build(parsed, expected_ids, field_options)
 
     flagged = sum(1 for m in matches.values() if m.needs_review)
     logger.info(
@@ -705,7 +715,7 @@ def match_fields(
 
 
 # --------------------------------------------------------------------------- #
-# Manual smoke test (safe to delete once integrated with Phase 2/4)
+# Manual test
 # --------------------------------------------------------------------------- #
 
 if __name__ == "__main__":
@@ -728,7 +738,7 @@ if __name__ == "__main__":
 
     sample_config = {
         "personal": {"first_name": "Alex", "last_name": "Rivera"},
-        "eeo": {},  # intentionally empty -> should force null/low confidence
+        "eeo": {},
     }
 
     try:

@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
 """
-main.py — Orchestrator for the local job application agent.
-
 Pipeline:
     scrape -> match -> inject -> review
 
-main.py owns the ENTIRE Playwright browser lifecycle now: it launches the
+main.py owns the entire Playwright browser lifecycle: it launches the
 browser and creates the page exactly once, passes that same page through
 every stage, and is the only file that ever calls browser.close(). None of
-jobScraper.py / injection.py / review.py launch or close a browser anymore.
+jobScraper.py / injection.py / review.py launch or close a browser.
 
 Module contracts this file expects:
 
     jobScraper.JobFormScraper.scrape_page(page) -> dict
-        Scrapes an ALREADY-NAVIGATED page (and its frames). Does not
-        navigate or manage the browser itself.
+        Scrapes an already-navigated page (and its frames).
         Returns: {"source_url": ..., "field_count": ..., "fields": [...]}
 
     aiMatcher.match_fields(form_fields: list[dict], config: dict) -> MatchResult
@@ -37,7 +34,6 @@ from pathlib import Path
 
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
-# --- Import project modules; fail fast with a clear message if missing ---
 try:
     import aiMatcher as aiMatcher_module
     from aiMatcher import match_fields, OllamaConnectionError, OllamaResponseError
@@ -60,17 +56,29 @@ LOG_DIR.mkdir(exist_ok=True)
 
 
 # ---------- Logging setup ----------
-def setup_logging() -> logging.Logger:
+def setup_logging(verbose: bool = False) -> logging.Logger:
+    """
+    The file log always captures DEBUG-level detail for this run. The
+    console only shows DEBUG-level messages (including the full scraped
+    payloads and raw LLM responses aiMatcher.py/jobScraper.py log at
+    debug level) when verbose=True, since those can include personal
+    data from config.json.
+    """
     logger = logging.getLogger("job_agent")
     logger.setLevel(logging.DEBUG)
     logger.handlers.clear()
+    # aiMatcher.py (imported above) installs a handler on the root logger
+    # via its own logging.basicConfig() call. Without this, every message
+    # logged here would also propagate up and print a second time through
+    # that root handler.
+    logger.propagate = False
 
     log_file = LOG_DIR / f"run_{datetime.now():%Y%m%d_%H%M%S}.log"
     file_handler = logging.FileHandler(log_file, encoding="utf-8")
     file_handler.setLevel(logging.DEBUG)
 
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
+    console_handler.setLevel(logging.DEBUG if verbose else logging.INFO)
 
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
     file_handler.setFormatter(fmt)
@@ -79,6 +87,22 @@ def setup_logging() -> logging.Logger:
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
     return logger
+
+
+def configure_verbosity(verbose: bool) -> None:
+    """
+    Raises the console log level for main.py's own "job_agent" logger,
+    and raises the root logger's level so aiMatcher / jobScraper /
+    injection / review's own loggers (which set no explicit level and
+    propagate to root) also start emitting their logger.debug() calls --
+    full scraped-candidate payloads, raw LLM responses, selector
+    diagnostics. Off by default: those calls include personal data from
+    config.json and shouldn't print unconditionally.
+    """
+    for handler in logger.handlers:
+        if isinstance(handler, logging.StreamHandler) and handler.stream is sys.stdout:
+            handler.setLevel(logging.DEBUG if verbose else logging.INFO)
+    logging.getLogger().setLevel(logging.DEBUG if verbose else logging.INFO)
 
 
 logger = setup_logging()
@@ -103,8 +127,7 @@ class ReviewError(Exception):
 
 # ---------- Pipeline stage wrappers ----------
 def run_scrape_stage(page: Page) -> list[dict]:
-    """jobScraper no longer navigates or owns a browser — it just reads the
-    page main.py already opened and navigated."""
+    """Scrapes form fields from an already-navigated page."""
     logger.info("Stage 1/4: Scraping form fields...")
     scraper = JobFormScraper(nav_timeout_ms=DEFAULT_NAV_TIMEOUT_MS)
     try:
@@ -124,15 +147,12 @@ def run_scrape_stage(page: Page) -> list[dict]:
 
 def _to_matcher_fields(scraped_fields: list[dict]) -> list[dict]:
     """
-    Translate jobScraper's field shape into what aiMatcher.match_fields
-    requires. field_id is now the scraper's human-readable context_key
-    (e.g. "graduation_date", "visa_sponsorship") rather than a raw CSS
-    selector or nth-of-type path -- the LLM reasons about this string
-    directly, so it needs to actually mean something. The REAL Playwright
-    selector (selector_hint) rides along separately in each dict and gets
-    re-attached to the injection record in _to_injection_records --
-    field_id itself is never used as a literal CSS selector anywhere
-    downstream anymore.
+    Translates jobScraper's field shape into what aiMatcher.match_fields
+    expects. field_id is the scraper's human-readable context_key (e.g.
+    "graduation_date", "visa_sponsorship"), not a raw CSS selector — the
+    LLM reasons about this string directly. The real Playwright selector
+    (selector_hint) rides along separately and gets re-attached in
+    _to_injection_records.
     """
     out = []
     for i, f in enumerate(scraped_fields):
@@ -143,14 +163,14 @@ def _to_matcher_fields(scraped_fields: list[dict]) -> list[dict]:
             "options": f.get("options", []),
             "selector_hint": f.get("selector_hint"),
             "option_selectors": f.get("option_selectors", {}),
+            "placeholder": f.get("placeholder"),
+            "name": f.get("name"),
         })
     return out
 
 
 def run_match_stage(scraped_fields: list[dict], config_path: str, model: str | None = None) -> dict:
-    """Pure data + HTTP call to Ollama — no page/browser involved, so this
-    stage sits safely between the shared page being scraped and being
-    injected into, without needing the page itself."""
+    """Loads config.json and sends scraped fields to the local Ollama matcher."""
     logger.info("Stage 2/4: Matching fields via local Ollama model...")
     try:
         with open(config_path, "r", encoding="utf-8") as fh:
@@ -161,9 +181,8 @@ def run_match_stage(scraped_fields: list[dict], config_path: str, model: str | N
         raise MatchError(f"Config file at '{config_path}' is not valid JSON: {e}") from e
 
     if model:
-        # aiMatcher.py hardcodes MODEL_NAME as a module constant rather than
-        # taking it as a parameter — override it directly if the caller asked
-        # for a specific model.
+        # aiMatcher.py hardcodes MODEL_NAME as a module constant; override
+        # it directly if the caller requested a specific model.
         aiMatcher_module.MODEL_NAME = model
 
     matcher_fields = _to_matcher_fields(scraped_fields)
@@ -188,34 +207,31 @@ def run_match_stage(scraped_fields: list[dict], config_path: str, model: str | N
 
 
 def _to_injection_records(match_data: dict) -> list[dict]:
-    """aiMatcher gives confidence 0-100 keyed by field_id; injection.py wants
-    selector/field_type/value/confidence(0-1)/label per record. Reshape and
-    rescale here. Low-confidence / null-value fields are kept in (not
-    dropped) so injection.py highlights them red for manual review.
+    """
+    Reshapes aiMatcher's field_id-keyed output (confidence 0-100) into the
+    selector/field_type/value/confidence(0-1)/label shape injection.py
+    expects. Low-confidence and null-value fields are kept (not dropped)
+    so injection.py highlights them red for manual review.
 
-    IMPORTANT: "selector" now comes from selector_hint (the REAL locator),
-    never from field_id (now a human-readable string like "graduation_date"
-    that would match nothing as a CSS selector). option_selectors rides
-    along for radio_group fields -- injection.py doesn't yet act on it
-    (that's the next piece of work), but the data is here when it does."""
+    "selector" comes from selector_hint (the real locator) — field_id is
+    now a human-readable string and would match nothing as a CSS
+    selector. placeholder/name ride along too; injection.py's
+    _resolve_locator() uses them alongside label as a resolution cascade,
+    since selector_hint alone can go stale between scrape and injection
+    on frameworks (e.g. Radix UI) that regenerate element ids on re-render.
+    """
     records = []
     for field_id, match in match_data["matches"].items():
         source = match_data["field_lookup"].get(field_id, {})
         records.append({
-            # NOTE: no "or field_id" fallback here anymore. field_id is a
-            # human-readable string (e.g. "authorized_no_cpt_opt_needed"),
-            # never a valid CSS selector -- using it as one caused
-            # Playwright to search for a literal, nonexistent
-            # <authorized_no_cpt_opt_needed> tag and time out. selector_hint
-            # being None is EXPECTED for radio_group fields (no single
-            # element represents the group; injection.py uses
-            # option_selectors instead) and is now handled explicitly there.
             "selector": source.get("selector_hint"),
             "field_type": source.get("type", "text"),
             "value": match.value,
             "confidence": (match.confidence or 0) / 100.0,
             "label": source.get("label") or field_id,
             "option_selectors": source.get("option_selectors", {}),
+            "placeholder": source.get("placeholder"),
+            "name": source.get("name"),
         })
     return records
 
@@ -238,8 +254,7 @@ def run_injection_stage(page: Page, match_data: dict) -> InjectionReport:
 
 
 def run_review_stage(page: Page, injection_report: InjectionReport) -> None:
-    """review.run_review_and_submit() owns the pause, the CLI confirm, the
-    submit click, and the CSV log entry in one call."""
+    """review.run_review_and_submit() owns the pause, CLI confirm, submit click, and CSV log entry."""
     logger.info("Stage 4/4: Handing off to human review gate...")
     injection_report.print_summary()
     try:
@@ -254,13 +269,16 @@ def main(
     config_path: str = DEFAULT_CONFIG_PATH,
     model: str | None = None,
     headless: bool = False,
+    verbose: bool = False,
 ) -> None:
     """
     Runs the full scrape -> match -> inject -> review pipeline against a
-    single job application URL, using ONE browser/page for the whole run.
+    single job application URL, using one browser/page for the whole run.
     Each stage is isolated so a failure at any point stops the run without
-    submitting anything, and is logged with full context.
+    submitting anything.
     """
+    configure_verbosity(verbose)
+
     if headless:
         logger.warning(
             "Running headless — review.py's page.pause() will not work; "
@@ -272,7 +290,6 @@ def main(
     with sync_playwright() as p:
         browser = None
         try:
-            # --- Single browser/context/page for the entire pipeline ---
             browser = p.chromium.launch(headless=headless)
             context = browser.new_context()
             page = context.new_page()
@@ -285,34 +302,29 @@ def main(
                 return
 
             try:
-                # Best-effort settle for SPA-heavy pages; not fatal if it
-                # never truly idles (this used to live inside jobScraper).
+                # Best-effort settle for SPA-heavy pages; not fatal if it never truly idles.
                 page.wait_for_load_state("networkidle", timeout=8000)
             except PlaywrightTimeoutError:
                 pass
 
-            # --- Stage 1: scrape ---
             try:
                 fields = run_scrape_stage(page)
             except ScrapeError as e:
                 logger.error(f"Aborting run — scrape stage failed: {e}")
                 return
 
-            # --- Stage 2: match (no page needed) ---
             try:
                 match_data = run_match_stage(fields, config_path, model)
             except MatchError as e:
                 logger.error(f"Aborting run — AI matching stage failed: {e}")
                 return
 
-            # --- Stage 3: inject (same page) ---
             try:
                 injection_report = run_injection_stage(page, match_data)
             except InjectionError as e:
                 logger.error(f"Aborting run — injection stage failed: {e}")
                 return
 
-            # --- Stage 4: review (same page) ---
             try:
                 run_review_stage(page, injection_report)
             except ReviewError as e:
@@ -324,7 +336,6 @@ def main(
         except Exception as e:
             logger.exception(f"Unhandled error in pipeline: {e}")
         finally:
-            # main.py is the ONLY place that closes the browser.
             if browser:
                 browser.close()
             logger.info("=== Run finished. Browser closed. ===\n")
@@ -345,9 +356,25 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run browser headless (disables the visual page.pause() review step).",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help=(
+            "Enable DEBUG-level logging, including full scraped-candidate "
+            "payloads, raw LLM responses, and selector diagnostics. Off by "
+            "default since this can print personal data (your config.json "
+            "profile) to the console."
+        ),
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    main(target_url=args.url, config_path=args.config, model=args.model, headless=args.headless)
+    main(
+        target_url=args.url,
+        config_path=args.config,
+        model=args.model,
+        headless=args.headless,
+        verbose=args.verbose,
+    )

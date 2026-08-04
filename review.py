@@ -1,35 +1,22 @@
 """
-Phase 5: The Review Gate
-========================
-Human-in-the-loop safety mechanism for the local job application agent.
-
-This module assumes Phases 1-4 have already run:
-  - Phase 1: Extraction   (Playwright scrapes form fields)
-  - Phase 2: Processing   (Ollama maps fields to your master JSON config)
-  - Phase 3: Injection    (Playwright fills in the values)
-  - Phase 4: Confidence styling (green/red borders based on AI confidence)
-
-Phase 5 is ATS-agnostic by design -- it never assumes a single fixed
-selector, page structure, or frame layout, because Ashby, Greenhouse,
-Lever, Workday, and dozens of smaller ATS platforms all build their
-"Submit" step differently. Instead it:
+Assumes extraction, AI field matching, injection, confidence-based styling. 
+This module is ATS-agnostic by design -- it never assumes a single fixed 
+selector, page structure, or frame layout, since every ATS platform builds 
+its "Submit" step differently. Instead it:
 
   - Tries a priority-ordered list of selectors for the submit button,
-    across the main frame AND every iframe on the page.
+    across the main frame and every iframe.
   - Validates that Phase 4's injected fields actually look resolved
-    (not empty, not still red-bordered) BEFORE handing control to you,
-    and prints exactly what still needs attention.
-  - Hands control to you via page.pause() and detects if you click
-    Submit yourself during that pause, so the CSV log is accurate either
-    way -- whether the script clicks Submit or you do.
-  - Never crashes on a timeout. If it can't find the form or the button
-    in time, it prints a page analysis and still pauses for you.
+    before handing control to the human, and prints what still needs
+    attention.
+  - Hands control to the human via page.pause() and detects a manual
+    Submit click during that pause, so the CSV log is accurate either way.
+  - Never crashes on a timeout — falls back to a page analysis and still
+    pauses for manual intervention.
 
-Nothing in this file submits anything automatically without either your
-explicit "Y" confirmation at the CLI, or your own manual click in the
-browser during the pause. The only two paths to a click on Submit are:
-resuming from the Inspector and confirming at the CLI, or clicking it
-yourself while paused.
+Nothing in this file submits anything without either explicit "Y"
+confirmation at the CLI, or a manual click in the browser during the
+pause.
 """
 
 from __future__ import annotations
@@ -51,8 +38,7 @@ from playwright.sync_api import (
 )
 
 # Reuse injection.py's confidence threshold so "red-bordered" means the
-# exact same thing here as it did when Phase 4 drew the border. Importing
-# rather than re-declaring avoids the two modules silently drifting apart.
+# same thing here as when Phase 4 drew the border.
 from injection import CONFIDENCE_THRESHOLD
 
 if TYPE_CHECKING:
@@ -69,9 +55,9 @@ logger = logging.getLogger("review_gate")
 LOG_FILE = Path("applications_log.csv")
 LOG_FIELDS = ["timestamp_utc", "url", "status", "notes"]
 
-# Requirement 1: priority-ordered selector list. Broader/riskier selectors
-# (like [role="button"]) sit lower than exact, unambiguous ones so a page
-# with a proper type="submit" button never falls through to a guess.
+# Priority-ordered: broader/riskier selectors (e.g. [role="button"]) sit
+# lower than exact, unambiguous ones so a page with a proper
+# type="submit" button never falls through to a guess.
 SUBMIT_SELECTOR_PRIORITY = [
     '[type="submit"]',
     '[role="button"]',
@@ -81,32 +67,26 @@ SUBMIT_SELECTOR_PRIORITY = [
     'text="Apply"',
 ]
 
-# Per-selector wait budget when searching a single frame.
-SUBMIT_SELECTOR_TIMEOUT_MS = 4000
-# Smaller budget per iframe, since we may have to check several.
-FRAME_SUBMIT_TIMEOUT_MS = 2000
-# Hard ceiling across the ENTIRE search (main frame + all iframes combined)
-# so a page with many iframes can't turn this into a multi-minute hang.
-OVERALL_SUBMIT_SEARCH_BUDGET_S = 20
+SUBMIT_SELECTOR_TIMEOUT_MS = 4000    # per-selector wait budget in a single frame
+FRAME_SUBMIT_TIMEOUT_MS = 2000       # smaller budget per iframe, since several may be checked
+OVERALL_SUBMIT_SEARCH_BUDGET_S = 20  # hard ceiling across main frame + all iframes combined
 
-# injection.py's RED_BORDER is "3px solid #e74c3c" -- browsers normalize
-# hex to rgb() in the DOM, so this is what we grep for when falling back
-# to a live DOM scan (see validate_form_state's fallback path).
+# injection.py's RED_BORDER normalizes to this rgb() fragment in the DOM
+# -- used by the DOM-scan fallback in validate_form_state.
 _RED_BORDER_RGB_FRAGMENT = "231, 76, 60"
 
 # --- Verification Gate (post-submit confirmation) ---
-# How long we'll block after a Submit click, waiting for real evidence the
-# submission went through, before giving up and logging a timeout instead
-# of a false "SUBMITTED". This is what prevents main.py's browser.close()
-# from firing while the ATS is still processing the request.
+# How long to block after a Submit click, waiting for real evidence the
+# submission went through, before logging a timeout instead of a false
+# "SUBMITTED". This is what prevents main.py's browser.close() from
+# firing while the ATS is still processing the request.
 VERIFICATION_TIMEOUT_MS = 30000
 VERIFICATION_POLL_INTERVAL_MS = 500
 
 # URL substrings commonly present on ATS "thank you" / confirmation pages.
 SUCCESS_URL_KEYWORDS = ("thank", "confirm", "success", "submitted", "complete")
 
-# On-page elements commonly used for inline success banners on SPA-style
-# ATS forms that never actually navigate away (no URL change to catch).
+# Inline success banners for SPA-style ATS forms that never navigate away.
 SUCCESS_SELECTOR_CANDIDATES = [
     'text=/thank you/i',
     'text=/application (submitted|received|complete)/i',
@@ -147,34 +127,24 @@ def log_application(url: str, status: str, notes: str = "") -> None:
 
 
 # --------------------------------------------------------------------------
-# Requirement 1 + 2: Priority-based, frame-aware submit button detection
+# Priority-based, frame-aware submit button detection
 # --------------------------------------------------------------------------
 
 def find_and_wait_for_submit(context: Page | Frame, timeout_ms: int = SUBMIT_SELECTOR_TIMEOUT_MS) -> Locator | None:
     """
-    Iterates SUBMIT_SELECTOR_PRIORITY in order against a single frame
-    (main page or an iframe), returning the first locator that resolves to
-    a visible AND enabled element within timeout_ms.
+    Iterates SUBMIT_SELECTOR_PRIORITY against a single frame, returning
+    the first locator that resolves to a visible and enabled element.
+    Matches on substrings/regex (case-insensitive) rather than exact
+    text, then falls back to a broader regex pass if the priority list
+    finds nothing.
 
-    A note on Shadow DOM, since it's a common culprit for "invisible"
-    buttons: Playwright's `css` and `text` selector engines already pierce
-    OPEN shadow roots automatically -- `context.locator("button")` finds a
-    <button> inside an open shadow root with zero special syntax. There is
-    no `*css=` prefix in Playwright (that's not a real selector engine);
-    if you've seen that syntax somewhere it won't do anything special here.
-    CLOSED shadow roots (`attachShadow({mode: "closed"})`) are a genuine
-    browser security boundary -- no automation tool, Playwright included,
-    can reach into one without the page's own cooperation. If Ashby is
-    using closed shadow DOM for its submit button specifically (uncommon,
-    but possible), the only reliable path is clicking it yourself during
-    the review pause -- which `run_review_and_submit`'s manual-click
-    detector already supports.
-
-    Given that, the far more common reason a real, non-shadow button gets
-    missed is simpler: the button's actual visible text doesn't exactly
-    match our literal priority list. This function now matches on
-    substrings/regex (case-insensitive) rather than exact text, and falls
-    back to a broader regex pass if the priority list finds nothing.
+    Note on Shadow DOM: Playwright's css/text selector engines already
+    pierce OPEN shadow roots automatically, no special syntax needed.
+    CLOSED shadow roots are a genuine browser security boundary no
+    automation tool can reach without the page's cooperation — if a site
+    uses closed shadow DOM for its submit button, the only reliable path
+    is a manual click during the review pause (run_review_and_submit's
+    manual-click detector supports this).
     """
     for selector in SUBMIT_SELECTOR_PRIORITY:
         try:
@@ -195,10 +165,6 @@ def find_and_wait_for_submit(context: Page | Frame, timeout_ms: int = SUBMIT_SEL
         except PlaywrightError:
             continue
 
-    # --- Fallback pass: broader regex text matching across common submit
-    # phrasing, since real ATS copy varies a lot ("Submit Application",
-    # "Send Application", "Finish", "Continue", "Complete") and our exact
-    # literal priority list above won't catch every variant.
     locator = _regex_text_fallback(context, timeout_ms)
     if locator:
         return locator
@@ -208,10 +174,10 @@ def find_and_wait_for_submit(context: Page | Frame, timeout_ms: int = SUBMIT_SEL
 
 def _regex_text_fallback(context: Page | Frame, timeout_ms: int) -> Locator | None:
     """
-    Broader, case-insensitive regex pass over button-like elements. Tried
-    only after the exact priority list is exhausted, since it's more
-    likely to grab the wrong element (e.g. "Continue to next step" on a
-    multi-page form that isn't actually the final submit).
+    Broader, case-insensitive regex pass over button-like elements, tried
+    only after the exact priority list is exhausted (more likely to grab
+    the wrong element, e.g. "Continue to next step" on a multi-page form
+    that isn't the final submit).
     """
     pattern = re.compile(
         r"submit|apply|send application|finish|complete|continue|next",
@@ -250,12 +216,11 @@ def _regex_text_fallback(context: Page | Frame, timeout_ms: int) -> Locator | No
 
 def _dump_visible_buttons(page: Page) -> None:
     """
-    Diagnostic aid for when NOTHING matched, across every strategy and
-    every frame: prints the text of every visible button-like element on
-    the page, so you can see exactly what's there and either add a new
-    phrase to _regex_text_fallback's pattern, or confirm it really is
-    something automation-inaccessible (closed shadow DOM, canvas-rendered
-    UI, etc.) that needs a manual click instead.
+    Diagnostic for when nothing matched across every strategy and frame:
+    prints every visible button-like element so you can either extend
+    _regex_text_fallback's pattern or confirm it's something
+    automation-inaccessible (closed shadow DOM, canvas UI) needing a
+    manual click.
     """
     print("\n" + "-" * 70)
     print("[review_gate] DIAGNOSTIC: visible button-like elements found on page")
@@ -286,14 +251,13 @@ def _dump_visible_buttons(page: Page) -> None:
 
 def _locate_submit_with_fallback(page: Page) -> tuple[Locator | None, Frame | None]:
     """
-    Requirement 2: tries the main frame first, then every iframe on the
-    page, since many ATS forms (Greenhouse, some Workday embeds) render
-    the actual form -- and its submit button -- inside a cross-origin
+    Tries the main frame first, then every iframe, since many ATS forms
+    render the actual form (and its submit button) inside a cross-origin
     iframe rather than the top-level document.
 
-    Raises PlaywrightTimeoutError if the OVERALL search budget is
-    exceeded, so Requirement 5's caller can catch it and fail soft
-    instead of hanging indefinitely across many iframes.
+    Raises PlaywrightTimeoutError if the overall search budget is
+    exceeded, so the caller can fail soft instead of hanging indefinitely
+    across many iframes.
     """
     deadline = time.monotonic() + OVERALL_SUBMIT_SEARCH_BUDGET_S
 
@@ -321,14 +285,14 @@ def _locate_submit_with_fallback(page: Page) -> tuple[Locator | None, Frame | No
 
 
 # --------------------------------------------------------------------------
-# Requirement 5: timeout-resilient page analysis
+# Timeout-resilient page analysis
 # --------------------------------------------------------------------------
 
 def _print_page_analysis(page: Page) -> None:
     """
-    Printed instead of crashing when the button/form search times out.
-    Gives you enough context (URL + how many inputs Playwright can still
-    see) to know where to look once you take over manually.
+    Printed instead of crashing when the button/form search times out —
+    gives enough context (URL + visible input count) to know where to
+    look once manual intervention takes over.
     """
     try:
         input_count = page.locator("input, select, textarea, [role='combobox']").count()
@@ -353,23 +317,21 @@ def _print_page_analysis(page: Page) -> None:
 
 
 # --------------------------------------------------------------------------
-# Requirement 3: Validation before pause
+# Validation before pause
 # --------------------------------------------------------------------------
 
 def validate_form_state(page: Page, injection_report: "InjectionReport | None" = None) -> list[str]:
     """
-    Returns a list of human-readable descriptions of fields that still
-    need attention, so you know exactly what to look for the moment the
-    browser pauses -- rather than having to eyeball the whole page.
+    Returns human-readable descriptions of fields that still need
+    attention, so the reviewer knows what to look for the moment the
+    browser pauses.
 
-    Preferred path: if `injection_report` (from Phase 4) is supplied, this
-    reads its results directly -- accurate, no DOM guessing, matches
-    exactly what injection.py decided was low-confidence or failed.
+    Preferred path: if `injection_report` is supplied, reads its results
+    directly — accurate, matches exactly what injection.py decided.
 
-    Fallback path: if no injection_report is available, scans the live DOM
-    for elements still carrying injection.py's red inline border style.
-    This is a heuristic -- it can't tell you WHY a field is flagged, only
-    THAT it is -- so prefer passing injection_report when you can.
+    Fallback path: if no injection_report is available, scans the live
+    DOM for elements still carrying injection.py's red inline border
+    style. Heuristic — can't say WHY a field is flagged, only THAT it is.
     """
     unresolved: list[str] = []
 
@@ -387,7 +349,6 @@ def validate_form_state(page: Page, injection_report: "InjectionReport | None" =
             unresolved.append(f"{r.label} — {reason}")
         return unresolved
 
-    # --- Fallback: no injection_report passed in, scan the DOM directly ---
     try:
         flagged_elements = page.eval_on_selector_all(
             "*",
@@ -418,7 +379,7 @@ def _print_validation_warning(unresolved: list[str]) -> None:
 
 
 # --------------------------------------------------------------------------
-# Requirement 4: The Review Gate itself, with manual-click detection
+# The Review Gate itself, with manual-click detection
 # --------------------------------------------------------------------------
 
 _CLICK_FLAG_JS_VAR = "__jobAgentSubmitClicked"
@@ -427,9 +388,8 @@ _CLICK_FLAG_JS_VAR = "__jobAgentSubmitClicked"
 def _arm_manual_click_detector(page: Page, submit_locator: Locator) -> None:
     """
     Attaches a one-time listener to the resolved submit button before the
-    pause, so that if YOU click it manually in the browser while paused
-    (rather than letting the script click it after you resume), we can
-    still tell that happened and log the correct status.
+    pause, so a manual click during the pause (rather than the script
+    clicking it after resume) is still detected and logged correctly.
     """
     try:
         page.evaluate(f"() => {{ window.{_CLICK_FLAG_JS_VAR} = false; }}")
@@ -450,12 +410,11 @@ def _was_submit_clicked_manually(page: Page) -> bool:
 
 def open_review_gate(page: Page) -> None:
     """
-    Freeze automation and hand control to the human reviewer.
-
-    page.pause() opens the Playwright Inspector and halts script execution
-    indefinitely — nothing after this call runs until you click "Resume"
-    (or step through) in the Inspector. It will NOT resume on a timer and
-    will NOT submit anything on its own.
+    Freezes automation and hands control to the human reviewer.
+    page.pause() opens the Playwright Inspector and halts execution
+    indefinitely — nothing after this call runs until Resume is clicked
+    (or stepped through). It will not resume on a timer and will not
+    submit anything on its own.
     """
     print("\n" + "=" * 70)
     print("REVIEW GATE: Application form has been filled and styled.")
@@ -467,7 +426,7 @@ def open_review_gate(page: Page) -> None:
     print("  (b) just click Resume and confirm submission at this terminal.")
     print("=" * 70 + "\n")
 
-    page.pause()  # <-- hard stop; nothing below runs until you resume
+    page.pause()  # hard stop; nothing below runs until resumed
 
 
 # --------------------------------------------------------------------------
@@ -476,39 +435,24 @@ def open_review_gate(page: Page) -> None:
 
 def verify_submission(page: Page, timeout_ms: int = VERIFICATION_TIMEOUT_MS) -> tuple[bool, str]:
     """
-    Blocking verification gate. Called immediately after ANY Submit click
-    — whether the script clicked it or you did manually during the pause
-    — and does not return until either real evidence of success appears,
-    or timeout_ms elapses.
+    Blocking verification gate, called immediately after any Submit
+    click (script- or human-initiated). Does not return until either
+    real evidence of success appears or timeout_ms elapses.
 
-    This is the actual fix for the race condition: main.py's browser.close()
-    lives in a `finally` block that only runs once run_review_and_submit()
-    returns. As long as this function blocks until the ATS has genuinely
-    finished processing the submission, main.py cannot close the browser
-    out from under an in-flight request — there's no separate thread or
-    async task racing against the close, it's a straightforward "don't
-    return until you have proof" gate in otherwise fully synchronous code.
+    This closes the race condition where main.py's browser.close() (in a
+    `finally` block) could fire while an ATS submission is still in
+    flight — as long as this function blocks on real evidence, the
+    browser can't close out from under an in-flight request.
 
-    Why not time.sleep(N)? A fixed sleep is a guess with no feedback loop:
-    too short and you log SUCCESS while the request is still in flight
-    (exactly the bug you're hitting today, from the old 1.5s sleep before
-    this function existed); too long and every single run — including ones
-    that confirm in under a second — pays the full fixed cost. Polling
-    against real page state (URL change or a success element appearing)
-    returns the moment we have actual evidence, and only burns the full
-    timeout when something is genuinely wrong, which is itself useful
-    signal: a SUBMIT_TIMEOUT in the log means "went unconfirmed," not
-    just "we didn't wait long enough."
-
-    wait_for_url() alone isn't enough either: plenty of modern ATS forms
-    (React SPAs especially) show an inline "Thank you" banner via AJAX
-    without changing the URL at all. So this checks both a URL keyword
-    match AND a set of common success-element selectors on every poll,
-    rather than picking one strategy and hoping it's the right one for
-    this particular ATS.
+    Uses a polling loop rather than a fixed sleep, since a fixed delay is
+    a guess with no feedback: too short risks logging SUCCESS mid-flight,
+    too long wastes time on every run including fast ones. Checks both a
+    URL keyword match AND a set of common success-element selectors on
+    every poll, since many ATS forms confirm via an inline AJAX banner
+    without changing the URL at all.
 
     Returns:
-        (True, description) the moment success evidence is found.
+        (True, description) once success evidence is found.
         (False, description) if timeout_ms elapses with no confirmation.
     """
     deadline = time.monotonic() + (timeout_ms / 1000)
@@ -543,19 +487,18 @@ def verify_submission(page: Page, timeout_ms: int = VERIFICATION_TIMEOUT_MS) -> 
 
 def submit_application(page: Page, submit_locator: Locator | None = None, dry_run: bool = False) -> bool:
     """
-    Click the final Submit/Apply button, then BLOCK on verify_submission()
-    before logging or returning. Call this AFTER you've resumed from
-    page.pause() and are satisfied with the form.
+    Clicks the final Submit/Apply button, then blocks on
+    verify_submission() before logging or returning. Call this after
+    resuming from page.pause() and reviewing the form.
 
     Args:
         page: the active Playwright Page.
         submit_locator: a pre-resolved Locator (preferred — avoids
             re-searching after the page may have changed during review).
-        dry_run: if True, locate the button and log intent WITHOUT
-                 clicking. Useful for testing selector logic safely.
+        dry_run: if True, locate the button and log intent without clicking.
 
     Returns:
-        True if submission was clicked AND verified (or dry run).
+        True if submission was clicked and verified (or dry run).
         False if no button was found, the click failed, or verification
         timed out without confirmation.
     """
@@ -579,12 +522,10 @@ def submit_application(page: Page, submit_locator: Locator | None = None, dry_ru
         return True
 
     try:
-        # Let any manual edits (dropdown opens, client-side validation,
-        # etc.) settle before we click.
         page.wait_for_load_state("networkidle", timeout=5000)
     except PlaywrightTimeoutError:
-        # Non-fatal — some ATS pages keep background polling alive and
-        # never truly go idle. Proceed anyway.
+        # Non-fatal -- some ATS pages keep background polling alive and
+        # never truly go idle.
         print("[submit_application] networkidle wait timed out; continuing.")
 
     try:
@@ -615,32 +556,31 @@ def submit_application(page: Page, submit_locator: Locator | None = None, dry_ru
 
 def run_review_and_submit(page: Page, injection_report: "InjectionReport | None" = None) -> None:
     """
-    Drop-in call for the end of your main pipeline:
+    Drop-in call for the end of the pipeline:
 
         inject_matched_fields(page, matched_fields)          # Phase 4
         run_review_and_submit(page, injection_report)         # Phase 5 <- this
 
-    `injection_report` is optional so this still imports and runs cleanly
-    against an existing caller that only passes `page` — but pass it
-    whenever you have it, since Requirement 3's validation is far more
-    accurate with the real Phase 4 results than the DOM-scan fallback.
+    `injection_report` is optional so this still runs against a caller
+    that only passes `page`, but pass it whenever available — validation
+    is far more accurate with real Phase 4 results than the DOM-scan
+    fallback.
 
     Flow:
-      1. validate_form_state() checks for unresolved fields and prints a
-         warning BEFORE the pause, so you know what to look for.
-      2. The submit button is located (Requirements 1+2) and armed with a
-         manual-click detector (Requirement 4) before pausing.
+      1. validate_form_state() checks for unresolved fields and warns
+         before the pause.
+      2. The submit button is located and armed with a manual-click
+         detector before pausing.
       3. open_review_gate(page) freezes everything on page.pause().
-      4. You review/edit the form live in the browser — either clicking
-         Submit yourself, or just inspecting and resuming.
-      5. On resume: if you already clicked Submit manually, that's
-         detected and logged immediately. Otherwise you get one more
-         explicit CLI checkpoint ("Type 'Y' to submit") before the script
-         clicks it for you.
+      4. The reviewer inspects/edits the form live — either clicking
+         Submit themselves, or just resuming.
+      5. On resume: a manual Submit click is detected and logged
+         immediately; otherwise one more explicit CLI checkpoint ("Type
+         'Y' to submit") gates the script's own click.
 
-    Requirement 5: if button search or validation times out, this catches
-    it, prints a page analysis, and still pauses for manual intervention
-    rather than crashing or leaving the browser in an unknown state.
+    If button search or validation times out, this catches it, prints a
+    page analysis, and still pauses for manual intervention rather than
+    crashing or leaving the browser in an unknown state.
     """
     submit_locator: Locator | None = None
 
@@ -664,9 +604,9 @@ def run_review_and_submit(page: Page, injection_report: "InjectionReport | None"
         _print_page_analysis(page)
         submit_locator = None
 
-    open_review_gate(page)  # blocks here until you resume manually
+    open_review_gate(page)  # blocks here until resumed manually
 
-    # --- Everything below only executes after YOU resume in the Inspector ---
+    # --- Everything below only executes after the user resumes ---
 
     if submit_locator is not None and _was_submit_clicked_manually(page):
         print(
@@ -702,8 +642,8 @@ def run_review_and_submit(page: Page, injection_report: "InjectionReport | None"
 # Standalone manual trigger (for calling from the Inspector console)
 # --------------------------------------------------------------------------
 #
-# If you'd rather skip the CLI prompt entirely and just trigger submission
-# yourself from the Playwright Inspector's console while paused, you can
-# call submit_application(page) directly there instead of using
+# To skip the CLI prompt and trigger submission directly from the
+# Playwright Inspector's console while paused, call
+# submit_application(page) directly there instead of using
 # run_review_and_submit(). Both paths log to applications_log.csv the
 # same way.

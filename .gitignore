@@ -1,25 +1,35 @@
-# Python environment (never push this)
+# Python environment
 venv/
 .venv/
 env/
 
-# Cache files
+# Bytecode / cache
 __pycache__/
 *.pyc
+.pytest_cache/
 
-# Your local configuration (Never push your personal data!)
+# Personal data / local config -- never push these
 config.json
 navigator_state.json
+handshake_auth.json
+auth_state.json
+*_auth.json
 assets/
+test.py
 
-# If you create local logs or database files later
+# Runtime-generated logs and data
 *.log
 *.db
 applications_log.csv
 logs/
 
-# test environment/files
+# Local test fixtures (test.py itself is tracked -- see README)
 test_config.json
 test_form.html
 test.html
-test.py
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
