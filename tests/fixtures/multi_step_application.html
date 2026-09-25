@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Local multi-step application fixture</title></head>
+<body>
+  <main>
+    <h1>Application fixture</h1>
+    <p id="progress" aria-live="polite">Step 1 of 4: Basic information</p>
+    <form id="application" novalidate>
+      <section id="step-1" data-step="1" aria-labelledby="step-1-heading">
+        <h2 id="step-1-heading">Basic information</h2>
+        <label for="first-name">First name</label><input id="first-name" name="first_name" required autocomplete="given-name">
+        <label for="last-name">Last name</label><input id="last-name" name="last_name" required autocomplete="family-name">
+        <label for="email">Email</label><input id="email" name="email" type="email" required autocomplete="email">
+        <button type="button" data-action="continue">Continue</button>
+      </section>
+      <section id="step-2" data-step="2" aria-labelledby="step-2-heading" hidden>
+        <h2 id="step-2-heading">Employment</h2>
+        <fieldset>
+          <legend>Are you currently employed?</legend>
+          <label><input type="radio" name="currently_employed" value="yes" required>Yes</label>
+          <label><input type="radio" name="currently_employed" value="no">No</label>
+        </fieldset>
+        <div id="employer-followup" hidden>
+          <label for="current-employer">Current employer</label><input id="current-employer" name="current_employer">
+        </div>
+        <button type="button" data-action="back">Back</button>
+        <button type="button" data-action="continue">Continue</button>
+      </section>
+      <section id="step-3" data-step="3" aria-labelledby="step-3-heading" hidden>
+        <h2 id="step-3-heading">Contact confirmation</h2>
+        <label for="confirm-email">Confirm email</label><input id="confirm-email" name="confirm_email" type="email" required>
+        <button type="button" data-action="back">Back</button>
+        <button type="button" data-action="continue">Continue</button>
+      </section>
+      <section id="step-4" data-step="4" aria-labelledby="step-4-heading" hidden>
+        <h2 id="step-4-heading">Review application</h2>
+        <dl id="review-summary"></dl>
+        <button type="button" data-action="back">Back</button>
+        <button id="final-submit" type="submit">Submit application</button>
+      </section>
+    </form>
+    <p id="validation-error" role="alert" hidden></p>
+    <p id="submitted" role="status" hidden>Application submitted in local fixture.</p>
+  </main>
+  <script>
+    (() => {
+      const form = document.querySelector('#application');
+      const sections = [...document.querySelectorAll('[data-step]')];
+      const progress = document.querySelector('#progress');
+      const error = document.querySelector('#validation-error');
+      const followup = document.querySelector('#employer-followup');
+      const employer = document.querySelector('#current-employer');
+      const employed = [...document.querySelectorAll('[name="currently_employed"]')];
+      let step = 1;
+
+      function showError(message) {
+        error.textContent = message;
+        error.hidden = !message;
+      }
+      function showStep(next) {
+        step = next;
+        sections.forEach(section => { section.hidden = Number(section.dataset.step) !== step; });
+        progress.textContent = `Step ${step} of 4: ${sections[step - 1].querySelector('h2').textContent}`;
+        showError('');
+        if (step === 4) {
+          const summary = document.querySelector('#review-summary');
+          summary.replaceChildren();
+          for (const [label, value] of [
+            ['Name', `${form.elements.first_name.value} ${form.elements.last_name.value}`],
+            ['Email', form.elements.email.value],
+            ['Currently employed', form.elements.currently_employed.value],
+            ['Current employer', employer.value],
+            ['Confirmed email', form.elements.confirm_email.value]
+          ]) {
+            const term = document.createElement('dt');
+            const description = document.createElement('dd');
+            term.textContent = label;
+            description.textContent = value;
+            summary.append(term, description);
+          }
+        }
+      }
+      function validateCurrentStep() {
+        const required = [...sections[step - 1].querySelectorAll('[required]')];
+        const missing = required.find(input => !input.checkValidity());
+        if (missing) {
+          showError(`Complete the required field: ${missing.labels?.[0]?.textContent || missing.name}`);
+          return false;
+        }
+        if (step === 2 && employed.find(input => input.checked)?.value === 'yes' && !employer.value.trim()) {
+          showError('Current employer is required when currently employed is Yes.');
+          return false;
+        }
+        showError('');
+        return true;
+      }
+      employed.forEach(input => input.addEventListener('change', () => {
+        const show = employed.find(choice => choice.checked)?.value === 'yes';
+        followup.hidden = !show;
+        employer.required = show;
+        if (!show) employer.value = '';
+        showError('');
+      }));
+      form.addEventListener('click', event => {
+        const button = event.target.closest('button[data-action]');
+        if (!button) return;
+        if (button.dataset.action === 'back') showStep(step - 1);
+        if (button.dataset.action === 'continue' && validateCurrentStep()) showStep(step + 1);
+      });
+      form.addEventListener('submit', event => {
+        event.preventDefault();
+        if (step !== 4) return;
+        document.querySelector('#submitted').hidden = false;
+        form.hidden = true;
+        progress.textContent = 'Submitted';
+        showError('');
+      });
+    })();
+  </script>
+</body>
+</html>
