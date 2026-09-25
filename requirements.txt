@@ -5,6 +5,9 @@ playwright>=1.55.0
 # --- HTTP client for local Ollama API calls (aiMatcher.py, navigator.py) ---
 requests>=2.32.0
 
+# --- V2 browser transport (jobagent/mcp_browser.py) ---
+mcp>=2,<3
+
 # --- Post-install steps (not pip-installable) ---
 # 1. playwright install chromium
 # 2. Install Ollama separately: https://ollama.com
