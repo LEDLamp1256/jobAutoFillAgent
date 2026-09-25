@@ -175,6 +175,27 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(employment_index, next(i for i, obs in enumerate(result.session.observations)
                                                if obs.heading == "Contact confirmation"))
 
+    async def test_acceptance_fill_only_stops_before_navigation(self):
+        browser = ScriptedBrowser()
+        session = ApplicationSession("fixture", "http://local/application")
+        result = await ApplicationController(browser, resolver()).run(session, allow_advance=False)
+        self.assertEqual(result.stop, ControllerStop.STOPPED_BEFORE_ADVANCE)
+        self.assertEqual({browser.values[key] for key in
+                          ("personal.first_name", "personal.last_name", "personal.email")},
+                         {"Ada", "Lovelace", "ada@example.test"})
+        self.assertFalse(any(kind == "advance" for kind, _ in browser.calls))
+        self.assertEqual(session.current_observation.heading, "Basic information")
+
+    async def test_fresh_preflight_observation_is_reused_without_second_navigation(self):
+        browser = ScriptedBrowser()
+        session = ApplicationSession("fixture", "http://local/application")
+        initial = await browser.navigate(session.job_url)
+        result = await ApplicationController(browser, resolver()).run(
+            session, allow_advance=False, initial_observation=initial)
+        self.assertEqual(result.stop, ControllerStop.STOPPED_BEFORE_ADVANCE)
+        self.assertEqual([kind for kind, _ in browser.calls].count("navigate"), 1)
+        self.assertEqual(session.observations[0], initial)
+
     async def test_validation_blocked_stops_without_retry(self):
         result, browser = await self.run_case(ScriptedBrowser(advance_behavior="validation"))
         self.assertEqual(result.stop, ControllerStop.VALIDATION_BLOCKED)

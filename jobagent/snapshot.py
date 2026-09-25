@@ -21,6 +21,14 @@ class SnapshotFormatError(ValueError):
     pass
 
 
+class SnapshotEmpty(SnapshotFormatError):
+    """The page has not exposed accessibility content yet."""
+
+
+class SnapshotAccessChallenge(SnapshotFormatError):
+    """The site returned an access challenge rather than an application."""
+
+
 @dataclass(frozen=True)
 class NormalizedSnapshot:
     observation: ApplicationObservation
@@ -73,10 +81,14 @@ class SnapshotNormalizer:
     def normalize(self, snapshot_text: str, observation_id: str) -> NormalizedSnapshot:
         if len(snapshot_text) > 200_000:
             raise SnapshotFormatError("snapshot exceeds bounded parser input")
+        if re.search(r"^- HTTP status: 429\s*$", snapshot_text, re.MULTILINE):
+            raise SnapshotAccessChallenge("site returned HTTP 429 access challenge")
         url_match = _URL.search(snapshot_text)
         yaml_match = _YAML.search(snapshot_text)
         if not url_match or not yaml_match:
             raise SnapshotFormatError("expected Playwright MCP page URL and YAML snapshot block")
+        if not yaml_match.group(1).strip():
+            raise SnapshotEmpty("accessibility snapshot is empty")
 
         headings: dict[int, str] = {}
         progress: str | None = None

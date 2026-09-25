@@ -69,6 +69,7 @@ def classify_advance(before: ApplicationObservation, after: ApplicationObservati
 
 
 class ControllerStop(str, Enum):
+    STOPPED_BEFORE_ADVANCE = "stopped_before_advance"
     READY_FOR_REVIEW = "ready_for_review"
     NEEDS_REVIEW = "needs_review"
     VALIDATION_BLOCKED = "validation_blocked"
@@ -111,13 +112,15 @@ class ApplicationController:
                          if isinstance(resolver, DeterministicAnswerResolver) else resolver)
         self.limits = limits or ControllerLimits()
 
-    async def run(self, session: ApplicationSession) -> ControllerResult:
+    async def run(self, session: ApplicationSession, *, allow_advance: bool = True,
+                  initial_observation: ApplicationObservation | None = None) -> ControllerResult:
         if session.current_observation is not None:
             raise ValueError("V2-4 controller starts with a new in-memory session")
         actions = same_step_actions = transitions = 0
         advance_needs_repair = False
         try:
-            session.record_observation(await self.browser.navigate(session.job_url))
+            session.record_observation(initial_observation if initial_observation is not None
+                                       else await self.browser.navigate(session.job_url))
             for _cycle in range(self.limits.max_cycles):
                 observation = session.current_observation
                 assert observation is not None
@@ -187,6 +190,9 @@ class ApplicationController:
                     stop = (ControllerStop.VALIDATION_BLOCKED if observation.validation_messages
                             else ControllerStop.NO_PROGRESS)
                     return ControllerResult(stop, session, "new questions produced no repair action")
+                if not allow_advance:
+                    return ControllerResult(ControllerStop.STOPPED_BEFORE_ADVANCE, session,
+                                            "safe current-step actions complete; advancement disabled")
                 advance_labels = [c for c in observation.navigation_controls
                                   if _norm(c.label) in _ADVANCE_LABELS]
                 controls = [c for c in observation.navigation_controls
