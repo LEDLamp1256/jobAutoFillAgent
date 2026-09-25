@@ -231,6 +231,15 @@ class SessionActionRecord:
 
 
 @dataclass(frozen=True)
+class ResolutionTrace:
+    observation_id: str
+    semantic_key: str | None
+    mapping_source: AnswerSource
+    answer_source: AnswerSource | None
+    status: str
+
+
+@dataclass(frozen=True)
 class StepTransition:
     from_heading: str | None
     from_progress: str | None
@@ -288,6 +297,7 @@ class ApplicationSession:
     validation_problems: tuple[str, ...] = ()
     uploaded_documents: set[str] = field(default_factory=set)
     action_history: list[SessionActionRecord] = field(default_factory=list)
+    resolution_history: list[ResolutionTrace] = field(default_factory=list)
     step_history: list[StepTransition] = field(default_factory=list)
     validation_history: list[tuple[str, ...]] = field(default_factory=list)
     outcome: ApplicationOutcome = ApplicationOutcome.IN_PROGRESS

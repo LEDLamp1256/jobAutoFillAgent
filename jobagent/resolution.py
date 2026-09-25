@@ -8,7 +8,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Protocol
 
 from .domain import Answer, AnswerScope, AnswerSource, ControlType, QuestionObservation
 
@@ -176,6 +176,7 @@ class Resolution:
     canonical: CanonicalResult
     answer: Answer | None = None
     reason: str = ""
+    mapping_source: AnswerSource = AnswerSource.DETERMINISTIC_RULE
 
 
 @dataclass
@@ -269,7 +270,18 @@ class DeterministicAnswerResolver:
         canonical = self.canonicalizer.canonicalize(question)
         if canonical.status is not CanonicalStatus.MATCHED or canonical.semantic_key is None:
             return Resolution(ResolutionStatus.UNRESOLVED, canonical, reason=canonical.reason)
+        return self.resolve_known_key(question, application_id, canonical)
+
+    def resolve_known_key(self, question: QuestionObservation, application_id: str,
+                          canonical: CanonicalResult) -> Resolution:
+        """Retrieve a trusted value for a code-validated semantic mapping."""
+        if not application_id.strip():
+            raise ValueError("application_id must be nonempty")
+        if canonical.status is not CanonicalStatus.MATCHED or canonical.semantic_key is None:
+            raise ValueError("a matched semantic key is required")
         key = canonical.semantic_key
+        if key not in _ALIASES and key not in self.profile.qa_bank:
+            raise ValueError("semantic key is not configured or supported")
         correction = self.ledger.application_human_correction(key, application_id)
         if correction:
             return self._finish(question, canonical, correction, application_id)
@@ -306,6 +318,9 @@ class DeterministicAnswerResolver:
             return self._finish(question, canonical, answer, application_id, raw_value=entry["answer"])
         return Resolution(ResolutionStatus.UNRESOLVED, canonical, reason="no trusted configured answer")
 
+    def record_answer(self, answer: Answer) -> None:
+        self.ledger.record(answer)
+
     @staticmethod
     def _finish(question: QuestionObservation, canonical: CanonicalResult, answer: Answer,
                 application_id: str, raw_value: Any | None = None) -> Resolution:
@@ -317,3 +332,21 @@ class DeterministicAnswerResolver:
         if not result.safe_for_automatic_fill(application_id):
             return Resolution(ResolutionStatus.REQUIRES_REVIEW, canonical, reason="answer is not approved for automatic filling")
         return Resolution(ResolutionStatus.SAFE_TO_FILL, canonical, result)
+
+
+class AsyncAnswerResolver(Protocol):
+    async def resolve(self, question: QuestionObservation, application_id: str) -> Resolution: ...
+    def record_answer(self, answer: Answer) -> None: ...
+
+
+class DeterministicAsyncResolver:
+    """Preserves the v2-4 synchronous resolver API at the async controller boundary."""
+
+    def __init__(self, resolver: DeterministicAnswerResolver):
+        self.resolver = resolver
+
+    async def resolve(self, question: QuestionObservation, application_id: str) -> Resolution:
+        return self.resolver.resolve(question, application_id)
+
+    def record_answer(self, answer: Answer) -> None:
+        self.resolver.record_answer(answer)

@@ -9,9 +9,12 @@ from jobagent.browser import BrowserPort, BrowserActionResult
 from jobagent.domain import (
     ActionPolicy, ActionStatus, Advance, ApplicationObservation, ApplicationOutcome,
     ApplicationSession, ChooseOption, ControlType, FillText, NavigationKind,
-    QuestionObservation, SessionActionRecord, StepTransition, semantic_fingerprint,
+    QuestionObservation, ResolutionTrace, SessionActionRecord, StepTransition, semantic_fingerprint,
 )
-from jobagent.resolution import DeterministicAnswerResolver, ResolutionStatus
+from jobagent.resolution import (
+    AsyncAnswerResolver, DeterministicAnswerResolver, DeterministicAsyncResolver,
+    ResolutionStatus,
+)
 
 
 def _norm(value: str | None) -> str:
@@ -100,10 +103,12 @@ _ADVANCE_LABELS = {"next", "continue", "save and continue", "save & continue"}
 class ApplicationController:
     """One application, one browser, one mutation at a time."""
 
-    def __init__(self, browser: BrowserPort, resolver: DeterministicAnswerResolver,
+    def __init__(self, browser: BrowserPort,
+                 resolver: AsyncAnswerResolver | DeterministicAnswerResolver,
                  limits: ControllerLimits | None = None):
         self.browser = browser
-        self.resolver = resolver
+        self.resolver = (DeterministicAsyncResolver(resolver)
+                         if isinstance(resolver, DeterministicAnswerResolver) else resolver)
         self.limits = limits or ControllerLimits()
 
     async def run(self, session: ApplicationSession) -> ControllerResult:
@@ -125,7 +130,12 @@ class ApplicationController:
                 mutated = False
                 pending: list[QuestionObservation] = []
                 for question in observation.questions:
-                    resolution = self.resolver.resolve(question, session.application_id)
+                    resolution = await self.resolver.resolve(question, session.application_id)
+                    session.resolution_history.append(ResolutionTrace(
+                        observation.observation_id, resolution.canonical.semantic_key,
+                        resolution.mapping_source,
+                        resolution.answer.source if resolution.answer else None,
+                        resolution.status.value))
                     if resolution.status is not ResolutionStatus.SAFE_TO_FILL or resolution.answer is None:
                         session.mark_unresolved(question)
                         if question.required is not False:
@@ -164,7 +174,7 @@ class ApplicationController:
                         return ControllerResult(ControllerStop.NO_PROGRESS, session,
                                                 "answer action did not change observed state")
                     session.record_answer(question, answer)
-                    self.resolver.ledger.record(answer)
+                    self.resolver.record_answer(answer)
                     advance_needs_repair = False
                     mutated = True
                     break  # Reinterpret every question against the fresh observation.
