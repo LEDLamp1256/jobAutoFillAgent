@@ -97,6 +97,26 @@ class SnapshotTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             SnapshotNormalizer(navigation_kinds={"Submit application": NavigationKind.ADVANCE})
 
+    def test_terminal_labels_and_review_advance_fail_closed(self):
+        for label in ("Apply", "Apply Now", "Send Application", "Finish Application",
+                      "Complete Application", "Submit Application"):
+            with self.subTest(label=label):
+                with self.assertRaises(ValueError):
+                    SnapshotNormalizer(navigation_kinds={label: NavigationKind.ADVANCE})
+                snapshot = REVIEW.replace("Submit application", label)
+                observation = self.normalizer.normalize(snapshot, "review").observation
+                self.assertEqual(observation.navigation_controls[-1].kind, NavigationKind.SUBMIT)
+        review_continue = REVIEW.replace('button "Submit application"', 'button "Continue"')
+        observation = self.normalizer.normalize(review_continue, "review").observation
+        self.assertEqual(observation.navigation_controls[-1].kind, NavigationKind.UNKNOWN)
+
+    def test_duplicate_advance_controls_are_ambiguous(self):
+        duplicate = STEP_1.replace('button "Continue" [ref=e11]',
+                                   'button "Continue" [ref=e11]\n    - button "Continue" [ref=e12]')
+        observation = self.normalizer.normalize(duplicate, "one").observation
+        self.assertEqual([c.kind for c in observation.navigation_controls],
+                         [NavigationKind.UNKNOWN, NavigationKind.UNKNOWN])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -50,9 +50,14 @@ def _scalar(text: str) -> str:
 
 def _nav_kind(label: str, explicit: Mapping[str, NavigationKind]) -> NavigationKind:
     normalized = " ".join(label.casefold().split())
-    if normalized.startswith("submit") or normalized in {"finish application", "send application"}:
+    if (normalized.startswith("submit") or normalized in
+            {"apply", "apply now", "send application", "finish application", "complete application"}):
         return NavigationKind.SUBMIT
-    return explicit.get(normalized, NavigationKind.UNKNOWN)
+    if normalized in {"next", "continue", "save and continue", "save & continue"}:
+        return explicit.get(normalized, NavigationKind.UNKNOWN)
+    if normalized == "back":
+        return explicit.get(normalized, NavigationKind.UNKNOWN)
+    return NavigationKind.UNKNOWN
 
 
 class SnapshotNormalizer:
@@ -136,6 +141,13 @@ class SnapshotNormalizer:
         heading = headings.get(2) or headings.get(1)
         if not heading:
             raise SnapshotFormatError("snapshot has no visible heading")
+        if "review" in heading.casefold():
+            controls = [NavigationControl(c.label, NavigationKind.UNKNOWN, c.target_ref)
+                        if c.kind is NavigationKind.ADVANCE else c for c in controls]
+        for label in {c.label.casefold() for c in controls if c.kind is NavigationKind.ADVANCE}:
+            if sum(c.label.casefold() == label for c in controls) > 1:
+                controls = [NavigationControl(c.label, NavigationKind.UNKNOWN, c.target_ref)
+                            if c.label.casefold() == label else c for c in controls]
         review_like = "review" in heading.casefold() and any(
             control.kind is NavigationKind.SUBMIT for control in controls
         )
