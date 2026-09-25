@@ -118,6 +118,8 @@ _ALIASES: dict[str, tuple[str, ...]] = {
     "employment.us_authorized": ("are you authorized to work in the us", "are you legally authorized to work in the united states", "authorized to work in the united states", "us work authorization"),
     "employment.sponsorship": ("do you require visa sponsorship", "will you require visa sponsorship", "will you now or in the future require sponsorship for employment visa status", "requires visa sponsorship"),
     "employment.relocation": ("are you willing to relocate", "willing to relocate"),
+    "employment.current": ("are you currently employed",),
+    "employment.current_employer": ("current employer",),
     "education.institution": ("school", "school name", "institution", "institution name", "university"),
     "education.degree": ("degree", "degree earned"),
     "education.gpa": ("gpa", "grade point average"),
@@ -220,6 +222,11 @@ def _profile_value(profile: CandidateProfile, key: str, question: QuestionObserv
         return address.get({"postal": "zip_code"}.get(key.rsplit(".", 1)[-1], key.rsplit(".", 1)[-1]))
     if key in fields:
         return personal.get(fields[key])
+    if key in {"employment.current", "employment.current_employer"}:
+        current = [item for item in profile.work_history if item.get("is_current") is True]
+        if len(current) != 1:
+            return None
+        return True if key == "employment.current" else current[0].get("company")
     if key.startswith("education."):
         entries = profile.education
         if question.record_context:

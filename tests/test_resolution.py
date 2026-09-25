@@ -235,6 +235,26 @@ class ResolverTests(unittest.TestCase):
         self.assertEqual(first.answer, repeated.answer)
         self.assertEqual(repeated, self.resolver.resolve(replace(step_three, target_ref="e99"), "A"))
 
+    def test_current_employer_requires_one_explicit_current_record(self):
+        field = question("Current employer", section="Employment")
+        choice = question("Are you currently employed?", control=ControlType.CHOICE,
+                          options=("Yes", "No"), section="Employment")
+        for records in ([], [{"company": "One", "is_current": False}],
+                        [{"company": "One", "is_current": True},
+                         {"company": "Two", "is_current": True}]):
+            with self.subTest(records=records):
+                data = profile_data()
+                data["work_history"] = records
+                resolver = DeterministicAnswerResolver(CandidateProfile.from_mapping(data))
+                self.assertEqual(resolver.resolve(field, "A").status, ResolutionStatus.UNRESOLVED)
+                self.assertEqual(resolver.resolve(choice, "A").status, ResolutionStatus.UNRESOLVED)
+        data = profile_data()
+        data["work_history"] = [{"company": "One", "is_current": True},
+                                {"company": "Old", "is_current": False}]
+        resolver = DeterministicAnswerResolver(CandidateProfile.from_mapping(data))
+        self.assertEqual(resolver.resolve(field, "A").answer.value, "One")
+        self.assertEqual(resolver.resolve(choice, "A").answer.value, "Yes")
+
     def test_partial_nonempty_answer_is_not_safe(self):
         data = profile_data()
         data["personal_info"]["email"] = "probably ada@example.test"

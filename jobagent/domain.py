@@ -37,7 +37,7 @@ class QuestionObservation:
     section: str | None = None
     record_context: str | None = None
     options: tuple[str, ...] = ()
-    required: bool = False
+    required: bool | None = None  # None means the browser did not establish optionality.
     current_value: str | None = None
     target_ref: str | None = None  # Valid only for this browser observation.
 
@@ -219,6 +219,25 @@ class ActionOutcome:
     after: ObservationFingerprint | None = None
 
 
+@dataclass(frozen=True)
+class SessionActionRecord:
+    """Action diagnostics without a reusable browser target."""
+
+    kind: str
+    semantic_key: str | None
+    before_observation_id: str
+    after_observation_id: str
+    outcome: ActionStatus
+
+
+@dataclass(frozen=True)
+class StepTransition:
+    from_heading: str | None
+    from_progress: str | None
+    to_heading: str | None
+    to_progress: str | None
+
+
 class ApplicationOutcome(str, Enum):
     IN_PROGRESS = "in_progress"
     READY_FOR_REVIEW = "ready_for_review"
@@ -268,6 +287,9 @@ class ApplicationSession:
     unresolved_questions: set[QuestionIdentity] = field(default_factory=set)
     validation_problems: tuple[str, ...] = ()
     uploaded_documents: set[str] = field(default_factory=set)
+    action_history: list[SessionActionRecord] = field(default_factory=list)
+    step_history: list[StepTransition] = field(default_factory=list)
+    validation_history: list[tuple[str, ...]] = field(default_factory=list)
     outcome: ApplicationOutcome = ApplicationOutcome.IN_PROGRESS
     submission_permission: SubmissionPermission = SubmissionPermission.LOCKED
     _approval: HumanApproval | None = field(default=None, init=False, repr=False)
@@ -296,6 +318,8 @@ class ApplicationSession:
         self.submission_permission = SubmissionPermission.LOCKED
         self.observations.append(observation)
         self.validation_problems = observation.validation_messages
+        if observation.validation_messages:
+            self.validation_history.append(observation.validation_messages)
         for question in observation.questions:
             self.question_history.setdefault(question.identity(), []).append(question)
         if not was_submitting:

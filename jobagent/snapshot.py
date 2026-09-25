@@ -89,18 +89,21 @@ class SnapshotNormalizer:
         group_indent = -1
         group_options: list[str] = []
         checked: str | None = None
+        group_required = False
 
         def finish_group() -> None:
-            nonlocal group_label, group_ref, group_options, checked
+            nonlocal group_label, group_ref, group_options, checked, group_required
             if group_label is not None and group_ref is not None:
                 questions.append(QuestionObservation(
                     label=group_label, control_type=ControlType.CHOICE,
                     semantic_key=self._aliases.get(group_label.casefold()),
                     section=headings.get(2), options=tuple(group_options),
-                    current_value=checked, target_ref=group_ref,
+                    current_value=checked, required=True if group_required else None,
+                    target_ref=group_ref,
                 ))
             group_label = group_ref = checked = None
             group_options = []
+            group_required = False
 
         for line in yaml_match.group(1).splitlines():
             indent = len(line) - len(line.lstrip())
@@ -118,6 +121,7 @@ class SnapshotNormalizer:
                 group_label, group_ref = _scalar(match.group(2)), match.group(3)
             elif match := _RADIO.match(line):
                 if group_ref is not None:
+                    group_required = group_required or "[required]" in match.group(2)
                     option = _scalar(match.group(1))
                     group_options.append(option)
                     option_targets[(group_ref, option)] = match.group(3)
@@ -129,7 +133,8 @@ class SnapshotNormalizer:
                     label=label, control_type=ControlType.TEXT,
                     semantic_key=self._aliases.get(label.casefold()),
                     section=headings.get(2), current_value=_scalar(match.group(4)) if match.group(4) else None,
-                    required="[required]" in match.group(2), target_ref=match.group(3),
+                    required=True if "[required]" in match.group(2) else None,
+                    target_ref=match.group(3),
                 ))
             elif match := _BUTTON.match(line):
                 label = _scalar(match.group(1))
