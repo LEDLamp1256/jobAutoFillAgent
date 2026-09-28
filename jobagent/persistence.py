@@ -205,12 +205,38 @@ class BatchStore:
                                row["review_checked_at"], row["review_checked_by"],
                                row["submitted_at"], row["submitted_by"])
 
-    def start(self, task_id: str) -> ApplicationTask:
+    def list_tasks(self, run_id: str | None = None) -> tuple[ApplicationTask, ...]:
+        """Return durable tasks in queue order. A resume joins the back of the queue."""
+        if run_id is not None:
+            self.get_run(run_id)
+        rows = self.db.execute(
+            "SELECT id FROM tasks WHERE (? IS NULL OR run_id = ?) ORDER BY updated_at, id",
+            (run_id, run_id)).fetchall()
+        return tuple(self.get_task(row["id"]) for row in rows)
+
+    def start(self, task_id: str, *, browser_session_id: str | None = None) -> ApplicationTask:
         task = self.get_task(task_id)
         if task.status is not TaskStatus.QUEUED:
             raise ValueError("only queued tasks can launch")
+        if browser_session_id is not None and not browser_session_id.strip():
+            raise ValueError("window identity must be nonempty")
         return self._transition(task_id, TaskStatus.LAUNCHING, Ownership.AUTOMATION_OWNED,
-                                browser_session_id=_id())
+                                browser_session_id=browser_session_id or _id())
+
+    def reassign_window(self, task_id: str, browser_session_id: str) -> ApplicationTask:
+        task = self.get_task(task_id)
+        if task.status not in _ACTIVE or task.ownership is not Ownership.AUTOMATION_OWNED:
+            raise ValueError("only active automation can reassign a window")
+        if not browser_session_id.strip():
+            raise ValueError("window identity must be nonempty")
+        return self._transition(task_id, task.status, task.ownership,
+                                browser_session_id=browser_session_id)
+
+    def clear_window(self, task_id: str, browser_session_id: str) -> ApplicationTask:
+        task = self.get_task(task_id)
+        if task.browser_session_id != browser_session_id or task.status in _ACTIVE:
+            raise ValueError("window association changed or task is active")
+        return self._transition(task_id, task.status, task.ownership, browser_session_id=None)
 
     def advance_state(self, task_id: str, status: TaskStatus, *, page_or_step: str | None = None) -> ApplicationTask:
         task = self.get_task(task_id)
