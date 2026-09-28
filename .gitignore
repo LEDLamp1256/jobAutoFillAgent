@@ -20,6 +20,12 @@ test.py
 # Runtime-generated logs and data
 *.log
 *.db
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
 applications_log.csv
 logs/
 
