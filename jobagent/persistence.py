@@ -79,6 +79,10 @@ class BatchStore:
                       tuple(json.loads(row["requested_sources"])), row["requested_job_limit"],
                       row["discovered_count"], row["queued_count"], row["completed_at"])
 
+    def list_runs(self) -> tuple[JobRun, ...]:
+        rows = self.db.execute("SELECT id FROM runs ORDER BY created_at, id").fetchall()
+        return tuple(self.get_run(row["id"]) for row in rows)
+
     def set_run_status(self, run_id: str, status: RunStatus) -> JobRun:
         current = self.get_run(run_id).status
         allowed = {
@@ -375,6 +379,9 @@ class BatchStore:
         rows = self.db.execute("SELECT * FROM report_entries WHERE application_task_id = ? ORDER BY created_at, id",
                                (task_id,)).fetchall()
         return ApplicationReport(task_id, tuple(self._entry(row) for row in rows))
+
+    def get_report_entry(self, entry_id: str) -> ReportEntry:
+        return self._entry(self._one("SELECT * FROM report_entries WHERE id = ?", (entry_id,)))
 
     @staticmethod
     def _entry(row: sqlite3.Row) -> ReportEntry:
