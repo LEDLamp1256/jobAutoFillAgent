@@ -22,6 +22,18 @@ TOOLS = [tool("browser_navigate", {"url"}), tool("browser_snapshot", set()),
          tool("browser_type", {"target", "text", "submit"}),
          tool("browser_click", {"target"}), tool("browser_close", set())]
 
+LOGIN = '''### Page
+- Page URL: https://example.test/login
+### Snapshot
+```yaml
+- main [ref=e2]:
+  - heading "Sign In" [level=1] [ref=e3]
+  - textbox "Email Address" [ref=e4]
+  - textbox "Password" [ref=e5]
+  - button "Sign In" [ref=e6]
+```
+'''
+
 
 class FakeClient:
     def __init__(self, parameters, *, tools=TOOLS, snapshots=None, tool_error=None):
@@ -52,6 +64,32 @@ class FakeClient:
 
 
 class AdapterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_login_actions_are_typed_reobserved_and_not_routine_submit(self):
+        fake = FakeClient(None, snapshots=[LOGIN, LOGIN, LOGIN, STEP_1])
+        async with PlaywrightMCPAdapter(MCPServerCommand("node", ("cli.js",)),
+                                        client_factory=lambda _: fake) as adapter:
+            first = await adapter.observe()
+            second = await adapter.fill_login_identity("e4", first.observation_id, "user@example.test")
+            with self.assertRaises(PermissionError):
+                await adapter.fill_login_password("e5", first.observation_id, "synthetic-test-secret")
+            third = await adapter.fill_login_password("e5", second.observation_id,
+                                                      "synthetic-test-secret")
+            after = await adapter.activate_login("e6", third.observation_id)
+            self.assertEqual(after.heading, "Basic information")
+            self.assertEqual([name for name, _ in fake.calls if name in {"browser_type", "browser_click"}],
+                             ["browser_type", "browser_type", "browser_click"])
+            self.assertNotIn("synthetic-test-secret", repr(third))
+
+    async def test_login_method_rejects_review_submit(self):
+        fake = FakeClient(None, snapshots=[REVIEW])
+        async with PlaywrightMCPAdapter(MCPServerCommand("node", ("cli.js",)),
+                                        client_factory=lambda _: fake) as adapter:
+            observation = await adapter.observe()
+            before = len(fake.calls)
+            with self.assertRaises(PermissionError):
+                await adapter.activate_login("e44", observation.observation_id)
+            self.assertEqual(len(fake.calls), before)
+
     async def test_capability_check_rejects_missing_or_changed_schema(self):
         with self.assertRaises(MCPToolContractError):
             validate_tool_contract(TOOLS[:-1])
@@ -96,6 +134,8 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(PermissionError):
                 await adapter.fill_text(action, session)
             self.assertEqual(len(fake.calls), before_calls)
+            self.assertIsNone(adapter.diagnostic_for(old.observation_id))
+            self.assertIsNotNone(adapter.diagnostic_for(fresh.observation_id))
 
     async def test_normal_navigation_rejects_submit_without_click(self):
         fake = FakeClient(None, snapshots=[REVIEW])

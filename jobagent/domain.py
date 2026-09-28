@@ -9,6 +9,7 @@ from typing import TypeAlias
 
 class ControlType(str, Enum):
     TEXT = "text"
+    SECRET = "secret"
     CHOICE = "choice"
     TOGGLE = "toggle"
     FILE = "file"

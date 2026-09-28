@@ -58,6 +58,16 @@ class ProfileTests(unittest.TestCase):
             CandidateProfile.from_json("/no/such/private-profile.json")
         self.assertNotIn("ada@example.test", str(error.exception))
 
+    def test_null_qa_answer_loads_as_missing_fact(self):
+        data = profile_data()
+        data["qa_bank"]["desired_salary"]["answer"] = None
+        profile = CandidateProfile.from_mapping(data)
+        result = DeterministicAnswerResolver(profile).resolve(question("Desired Salary"), "A")
+        self.assertEqual(result.status, ResolutionStatus.UNRESOLVED)
+        self.assertIsNone(result.answer)
+        with self.assertRaises(ProfileError):
+            CandidateProfile.from_mapping({**data, "qa_bank": {"desired_salary": {"notes": "missing"}}})
+
 
 class CanonicalizerTests(unittest.TestCase):
     def setUp(self):

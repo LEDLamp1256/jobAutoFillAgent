@@ -12,9 +12,10 @@ from mcp.client.stdio import StdioServerParameters
 from jobagent.browser import BrowserActionResult
 from jobagent.domain import (
     ActionOutcome, ActionPolicy, ActionStatus, Advance, ApplicationObservation,
-    ApplicationSession, ChooseOption, FillText, GoBack, semantic_fingerprint,
+    ApplicationSession, ChooseOption, ControlType, FillText, GoBack, NavigationKind,
+    semantic_fingerprint,
 )
-from jobagent.snapshot import NormalizedSnapshot, SnapshotNormalizer
+from jobagent.snapshot import NormalizedSnapshot, SnapshotDiagnostic, SnapshotNormalizer
 
 
 class MCPBrowserError(RuntimeError):
@@ -140,6 +141,12 @@ class PlaywrightMCPAdapter:
         self._last = self._normalizer.normalize(text, f"observation-{self._observation_counter}")
         return self._last.observation
 
+    def diagnostic_for(self, observation_id: str) -> SnapshotDiagnostic | None:
+        """Return only the bounded diagnostic for the current observation."""
+        if self._last is None or self._last.observation.observation_id != observation_id:
+            return None
+        return self._last.diagnostic
+
     def _check_action(self, action, session: ApplicationSession) -> ApplicationObservation:
         if self._last is None:
             raise PermissionError("fresh observation required before an action")
@@ -192,3 +199,50 @@ class PlaywrightMCPAdapter:
             raise PermissionError("only typed non-submit navigation is exposed")
         before = self._check_action(action, session)
         return await self._mutate("browser_click", {"target": action.target_ref}, before)
+
+    def _login_observation(self, observation_id: str) -> ApplicationObservation:
+        if self._last is None or self._last.observation.observation_id != observation_id:
+            raise PermissionError("login action requires a fresh matching observation")
+        observation = self._last.observation
+        heading = (observation.heading or "").casefold()
+        if observation.review_like or not any(term in heading for term in ("sign in", "log in", "login")):
+            raise PermissionError("login action requires an unambiguous login page")
+        return observation
+
+    async def _login_mutate(self, tool: str, arguments: dict) -> ApplicationObservation:
+        self._last = None
+        try:
+            await self._call(tool, arguments)
+        except Exception:
+            raise MCPBrowserError("login browser action failed") from None
+        return await self.observe()
+
+    async def fill_login_identity(self, target_ref: str, observation_id: str,
+                                  username: str) -> ApplicationObservation:
+        observation = self._login_observation(observation_id)
+        matches = [q for q in observation.questions if q.target_ref == target_ref and
+                   q.control_type is ControlType.TEXT and q.label.strip().casefold() in
+                   {"email", "email address", "username", "user name"}]
+        if len(matches) != 1 or not username:
+            raise PermissionError("login identity target is missing or ambiguous")
+        return await self._login_mutate("browser_type", {
+            "target": target_ref, "text": username, "submit": False})
+
+    async def fill_login_password(self, target_ref: str, observation_id: str,
+                                  password: str) -> ApplicationObservation:
+        observation = self._login_observation(observation_id)
+        matches = [q for q in observation.questions if q.target_ref == target_ref and
+                   q.control_type is ControlType.SECRET]
+        if len(matches) != 1 or not password:
+            raise PermissionError("login password target is missing or ambiguous")
+        return await self._login_mutate("browser_type", {
+            "target": target_ref, "text": password, "submit": False})
+
+    async def activate_login(self, target_ref: str, observation_id: str) -> ApplicationObservation:
+        observation = self._login_observation(observation_id)
+        sign_ins = [control for control in observation.navigation_controls if
+                    control.label.strip().casefold() in {"sign in", "log in", "login"}]
+        if (len(sign_ins) != 1 or sign_ins[0].target_ref != target_ref or
+                any(control.kind is NavigationKind.SUBMIT for control in observation.navigation_controls)):
+            raise PermissionError("login control is missing, ambiguous, or terminal")
+        return await self._login_mutate("browser_click", {"target": target_ref})

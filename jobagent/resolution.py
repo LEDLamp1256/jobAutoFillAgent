@@ -63,9 +63,10 @@ class CandidateProfile:
             if key in {"street", "city", "state", "zip_code", "country"} and not isinstance(value, str):
                 raise ProfileError(f"personal_info.address.{key} must be text")
         if not all(isinstance(key, str) and isinstance(value, dict) and
-                   isinstance(value.get("answer"), (str, bool, int, float))
+                   "answer" in value and
+                   (value["answer"] is None or isinstance(value["answer"], (str, bool, int, float)))
                    for key, value in data["qa_bank"].items()):
-            raise ProfileError("qa_bank entries require a scalar answer")
+            raise ProfileError("qa_bank entries require a scalar answer or null")
         if not all(value.get("scope") in (None, "global", "application") and
                    ("application_id" not in value or isinstance(value["application_id"], str))
                    for value in data["qa_bank"].values()):
@@ -301,6 +302,9 @@ class DeterministicAnswerResolver:
         if entry is None and key == "employment.sponsorship":
             entry = self.profile.qa_bank.get("will_require_visa_sponsorship")
         if entry is not None:
+            if entry["answer"] is None:
+                return Resolution(ResolutionStatus.UNRESOLVED, canonical,
+                                  reason="Q&A answer is not configured")
             scope_text = entry.get("scope")
             if key in {"why_this_company", "why_this_role"}:
                 if scope_text != "application" or entry.get("application_id") != application_id:

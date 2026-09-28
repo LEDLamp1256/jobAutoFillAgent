@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Login handoff fixture</title>
+<main>
+  <section id="login">
+    <h1>Sign In</h1>
+    <label>Email Address <input id="identity" type="email" autocomplete="username"></label>
+    <label>Password <input id="password" type="password" autocomplete="current-password"></label>
+    <button id="sign-in" type="button">Sign In</button>
+    <p id="error" role="alert" hidden></p>
+  </section>
+  <section id="application" hidden>
+    <h1>Personal Information</h1>
+    <label>First Name <input type="text"></label>
+  </section>
+</main>
+<script>
+  document.getElementById('sign-in').addEventListener('click', () => {
+    const username = document.getElementById('identity').value;
+    const password = document.getElementById('password').value;
+    if (username === 'user@example.test' && password === 'synthetic-test-secret') {
+      document.getElementById('login').hidden = true;
+      document.getElementById('application').hidden = false;
+    } else {
+      const error = document.getElementById('error');
+      error.textContent = 'Incorrect credentials';
+      error.hidden = false;
+    }
+  });
+</script>
+</html>

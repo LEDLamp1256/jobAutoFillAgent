@@ -11,6 +11,11 @@ facts remain missing; malformed sections raise `ProfileError`. The loader does
 not log or write profile content.
 For first and last names, optional explicit `personal_info.first_name` and
 `personal_info.last_name` values are used. `full_name` is not split into parts.
+Each Q&A entry needs an `answer` key. A scalar value is a configured answer;
+`null` means no answer is configured and resolves as `UNRESOLVED`. Missing
+`answer` keys and complex answer values remain invalid. The candidate config
+is passed explicitly to the acceptance CLI with `--config`; secrets belong in
+the separate credential provider, not this profile.
 
 The canonicalizer uses a short explicit alias table. It returns matched,
 ambiguous, or unresolved with a rule/reason. Browser refs never affect the

@@ -1,6 +1,8 @@
 {
   "personal_info": {
     "full_name": "John Doe",
+    "first_name": "John",
+    "last_name": "Doe",
     "preferred_name": "John",
     "email": "john.doe@example.com",
     "phone": "+1-555-123-4567",

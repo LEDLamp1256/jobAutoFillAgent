@@ -14,12 +14,16 @@ from enum import Enum
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from .authentication import (
+    CredentialProvider, InterventionReason, LoginIdentity, LoginOrchestrator,
+    LoginStatus, PageKind, classify_page, resume_after_human,
+)
 from .controller import ApplicationController, ControllerStop, step_signature
-from .domain import ApplicationObservation, ApplicationSession, NavigationKind
+from .domain import ApplicationObservation, ApplicationSession, ControlType, NavigationKind
 from .mcp_browser import MCPServerCommand, PlaywrightMCPAdapter
 from .resolution import CandidateProfile, DeterministicAnswerResolver, ProfileError
 from .semantic_llm import GroundedSemanticResolver, OllamaConfig, OllamaSemanticMapper
-from .snapshot import SnapshotAccessChallenge, SnapshotEmpty, SnapshotNormalizer
+from .snapshot import SnapshotAccessChallenge, SnapshotEmpty, SnapshotFormatError, SnapshotNormalizer
 
 
 GATE = "JOB_AGENT_RUN_REAL_ATS_ACCEPTANCE"
@@ -64,15 +68,6 @@ def server_command(cli: Path, cwd: Path) -> MCPServerCommand:
                              "--codegen", "none"), cwd)
 
 
-def authentication_required(observation: ApplicationObservation) -> bool:
-    heading = " ".join((observation.heading or "").casefold().split())
-    labels = " ".join(question.label.casefold() for question in observation.questions)
-    path = urlsplit(observation.location).path.casefold()
-    return (any(term in heading for term in ("sign in", "log in", "login", "create account",
-                                             "verify your email", "verification code")) or
-            ("password" in labels and any(term in path for term in ("login", "signin", "account"))))
-
-
 def _location_pattern(url: str) -> str:
     parsed = urlsplit(url)
     path = re.sub(r"\b[0-9a-f]{8,}\b|\b\d{4,}\b", ":id", parsed.path, flags=re.I)
@@ -83,19 +78,79 @@ def observation_summary(observation: ApplicationObservation) -> dict[str, object
     signature = hashlib.sha256(repr(step_signature(observation)).encode()).hexdigest()[:12]
     return {
         "location_pattern": _location_pattern(observation.location),
-        "heading": observation.heading,
-        "progress": observation.progress_text,
+        "heading": _safe_observation_label(observation.heading) if observation.heading else None,
+        "progress": (_safe_observation_label(observation.progress_text)
+                     if observation.progress_text else None),
         "step_signature": signature,
         "question_count": len(observation.questions),
-        "questions": [(q.label[:120], q.control_type.value, q.required) for q in observation.questions],
-        "controls": [(c.label[:120], c.kind.value) for c in observation.navigation_controls],
+        "questions": [(_safe_observation_label(q.label), q.control_type.value, q.required)
+                      for q in observation.questions[:12]],
+        "questions_truncated": len(observation.questions) > 12,
+        "controls": [(_safe_observation_label(c.label), c.kind.value)
+                     for c in observation.navigation_controls[:12]],
+        "controls_truncated": len(observation.navigation_controls) > 12,
         "validation_count": len(observation.validation_messages),
         "review_like": observation.review_like,
     }
 
 
+def _safe_observation_label(label: str) -> str:
+    """Keep a short form label while removing common embedded candidate values."""
+    label = re.sub(r"\b[^\s@]+@[^\s@]+\.[^\s@]+\b", "[email]", label)
+    label = re.sub(r"(?<!\w)\+?\d[\d\s().-]{7,}\d(?!\w)", "[phone]", label)
+    label = re.sub(r"\b\d+\s+[\w .'-]{1,60}\s+(?:street|st|avenue|ave|road|rd|drive|dr|lane|ln|boulevard|blvd)\b",
+                   "[address]", label, flags=re.I)
+    label = re.sub(r"https?://\S+|\b[0-9a-f]{12,}\b|\b\d{5,}\b", "[value]", label, flags=re.I)
+    if re.search(r"\b(password|passphrase|secret|token|cookie)\s*:", label, re.I):
+        return "[sensitive-label]"
+    return label[:100]
+
+
+def post_resume_diagnostic(before: ApplicationObservation, fresh: ApplicationObservation,
+                           previous_kind: PageKind, previous_reason: InterventionReason | None,
+                           fresh_kind: PageKind, fresh_reason: InterventionReason | None,
+                           comparison_reason: InterventionReason,
+                           same_state_stop: bool) -> dict[str, object]:
+    """Bounded evidence from normalized data; no field values or raw snapshot."""
+    heading = (fresh.heading or "").casefold()
+    identity_labels = {"email", "email address", "username", "user name"}
+    sign_in_labels = {"sign in", "log in", "login"}
+    return {
+        "phase": "after_owner_resume",
+        "location_pattern": _location_pattern(fresh.location),
+        "fresh_observation_id_differs": fresh.observation_id != before.observation_id,
+        "heading": _safe_observation_label(fresh.heading or ""),
+        "progress": _safe_observation_label(fresh.progress_text or ""),
+        "questions": len(fresh.questions),
+        "question_labels": tuple(_safe_observation_label(q.label) for q in fresh.questions[:12]),
+        "question_labels_truncated": len(fresh.questions) > 12,
+        "question_types": tuple(sorted({kind.value: sum(q.control_type is kind for q in fresh.questions)
+                                        for kind in ControlType if any(q.control_type is kind for q in fresh.questions)}.items())),
+        "required_true": sum(q.required is True for q in fresh.questions),
+        "navigation_controls": len(fresh.navigation_controls),
+        "navigation_labels": tuple(_safe_observation_label(c.label)
+                                   for c in fresh.navigation_controls[:12]),
+        "navigation_labels_truncated": len(fresh.navigation_controls) > 12,
+        "validation_count": len(fresh.validation_messages),
+        "review_like": fresh.review_like,
+        "login_heading": any(term in heading for term in ("sign in", "log in", "login")),
+        "secret_controls": sum(q.control_type is ControlType.SECRET for q in fresh.questions),
+        "login_identity_controls": sum(q.control_type is ControlType.TEXT and
+                                       q.label.strip().casefold() in identity_labels
+                                       for q in fresh.questions),
+        "sign_in_controls": sum(c.label.strip().casefold() in sign_in_labels
+                                for c in fresh.navigation_controls),
+        "previous_classification": (previous_kind.value,
+                                    previous_reason.value if previous_reason else None),
+        "fresh_classification": (fresh_kind.value, fresh_reason.value if fresh_reason else None),
+        "comparison_reason": comparison_reason.value,
+        "same_state_stop": same_state_stop,
+    }
+
+
 async def run_acceptance(url: str, profile: CandidateProfile | None, cli: Path, stage: AcceptanceStage,
-                         *, hold: bool = False) -> str:
+                         *, hold: bool = False, login_identity: LoginIdentity | None = None,
+                         credentials: CredentialProvider | None = None) -> str:
     app_id = hashlib.sha256(url.encode()).hexdigest()[:16]
     # The server's temporary working directory disappears after this invocation.
     with tempfile.TemporaryDirectory(prefix="jobagent-real-ats-") as directory:
@@ -107,6 +162,7 @@ async def run_acceptance(url: str, profile: CandidateProfile | None, cli: Path, 
         async with PlaywrightMCPAdapter(server_command(cli, Path(directory)),
                                        normalizer=normalizer) as browser:
             # Every invocation begins with an observation-only preflight.
+            handoffs = 0
             try:
                 try:
                     initial = await browser.navigate(url)
@@ -117,20 +173,79 @@ async def run_acceptance(url: str, profile: CandidateProfile | None, cli: Path, 
                     initial = await browser.observe()
             except SnapshotAccessChallenge as exc:
                 print(f"classification=ACCESS_CHALLENGE; reason={exc}")
-                if hold:
-                    await asyncio.to_thread(input, "Inspect the blocked page, then press Enter to close: ")
-                return "ACCESS_CHALLENGE"
-            print(f"initial_observation={observation_summary(initial)}")
-            if authentication_required(initial):
                 if not hold:
-                    print("classification=AUTH_REQUIRED; manual login is needed")
-                    return "AUTH_REQUIRED"
-                await asyncio.to_thread(input, "Complete authentication in the visible browser, then press Enter to re-observe: ")
-                initial = await browser.observe()
+                    return "HUMAN_INTERVENTION_REQUIRED"
+                handoffs += 1
+                try:
+                    initial = await resume_after_human(browser)
+                except SnapshotAccessChallenge:
+                    print("classification=HUMAN_INTERVENTION_REQUIRED; reason=access_challenge")
+                    return "HUMAN_INTERVENTION_REQUIRED"
+            print(f"initial_observation={observation_summary(initial)}")
+            login_attempted = False
+            for _ in range(3):  # At most three distinct, explicitly resumed human states.
+                state = classify_page(initial)
+                if state.kind is PageKind.LOGIN and login_attempted:
+                    print("classification=LOGIN_FAILED; repeated credential attempt is forbidden")
+                    return "LOGIN_FAILED"
+                if state.kind is PageKind.LOGIN and login_identity and credentials:
+                    login_attempted = True
+                    outcome = await LoginOrchestrator(browser, credentials).attempt(initial, login_identity)
+                    print(f"login_status={outcome.status.value}")
+                    if outcome.status is LoginStatus.AUTHENTICATED:
+                        initial = outcome.observation
+                        print(f"after_login={observation_summary(initial)}")
+                        break
+                    if outcome.status is LoginStatus.LOGIN_FAILED:
+                        return "LOGIN_FAILED"
+                    if outcome.status is LoginStatus.CREDENTIALS_UNAVAILABLE:
+                        return "CREDENTIALS_UNAVAILABLE"
+                    initial = outcome.observation
+                    if outcome.status is LoginStatus.HUMAN_INTERVENTION_REQUIRED:
+                        state = classify_page(initial)
+                        if outcome.reason is InterventionReason.ACCESS_CHALLENGE:
+                            state_reason = InterventionReason.ACCESS_CHALLENGE
+                        else:
+                            state_reason = outcome.reason
+                    else:
+                        state_reason = InterventionReason.HUMAN_JUDGMENT_REQUIRED
+                else:
+                    state_reason = state.reason or InterventionReason.HUMAN_JUDGMENT_REQUIRED
+                if state.kind is PageKind.APPLICATION:
+                    break
+                if state.kind is PageKind.UNKNOWN:
+                    if stage is AcceptanceStage.OBSERVE:
+                        break
+                    print("classification=UNKNOWN; no safe application or login state")
+                    return "UNKNOWN"
+                if not hold or handoffs >= 3:
+                    print(f"classification=HUMAN_INTERVENTION_REQUIRED; reason={state_reason.value}")
+                    return "HUMAN_INTERVENTION_REQUIRED"
+                handoffs += 1
+                print(f"classification=HUMAN_INTERVENTION_REQUIRED; reason={state_reason.value}")
+                try:
+                    fresh = await resume_after_human(browser)
+                except SnapshotAccessChallenge:
+                    print("classification=HUMAN_INTERVENTION_REQUIRED; reason=access_challenge")
+                    return "HUMAN_INTERVENTION_REQUIRED"
+                fresh_state = classify_page(fresh)
+                same_state_stop = (state_reason is not InterventionReason.ACCESS_CHALLENGE and
+                                   fresh_state.kind is state.kind and fresh_state.reason is state.reason)
+                print(f"post_resume_observation={post_resume_diagnostic(initial, fresh, state.kind, state.reason, fresh_state.kind, fresh_state.reason, state_reason, same_state_stop)}")
+                if fresh_state.kind is PageKind.UNKNOWN and not fresh.questions and not fresh.navigation_controls:
+                    diagnostic_for = getattr(browser, "diagnostic_for", None)
+                    diagnostic = diagnostic_for(fresh.observation_id) if callable(diagnostic_for) else None
+                    if diagnostic is not None:
+                        print(f"post_resume_control_diagnostic={{'roles': {diagnostic.roles!r}, "
+                              f"'controls': {diagnostic.control_predicates!r}, "
+                              f"'truncated': {diagnostic.truncated!r}}}")
+                if same_state_stop:
+                    print("classification=HUMAN_INTERVENTION_REQUIRED; state unchanged after resume")
+                    return "HUMAN_INTERVENTION_REQUIRED"
+                initial = fresh
                 print(f"after_owner_action={observation_summary(initial)}")
-                if authentication_required(initial):
-                    print("classification=AUTH_REQUIRED")
-                    return "AUTH_REQUIRED"
+            else:
+                return "HUMAN_INTERVENTION_REQUIRED"
             if stage is AcceptanceStage.OBSERVE:
                 classification = "FINAL_REVIEW" if initial.review_like else "OBSERVED"
                 print(f"classification={classification}")
@@ -181,6 +296,8 @@ def main(argv: list[str] | None = None) -> int:
             url, profile, cli, AcceptanceStage(args.stage), hold=args.hold))
     except Exception as exc:
         print(f"classification=OBSERVATION_FAILURE; error={type(exc).__name__}: {exc}", file=sys.stderr)
+        if isinstance(exc, SnapshotFormatError) and exc.diagnostic is not None:
+            print(f"sanitized_snapshot_diagnostic={exc.diagnostic!r}", file=sys.stderr)
         return 2
     return 2 if classification in {"FAILED", "OBSERVATION_FAILURE", "ACCESS_CHALLENGE"} else 0
 
