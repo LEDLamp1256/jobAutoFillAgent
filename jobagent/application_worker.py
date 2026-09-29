@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol
 
-from .batch_domain import ApplicationTask, Blocker, FailureReason
+from .batch_domain import ApplicationTask, Blocker, FailureReason, Provenance, Verification
 
 
 class WorkerYield(str, Enum):
@@ -23,6 +23,17 @@ class ReviewIssue:
     visible_label: str
     reason: str
     page_or_step: str | None = None
+    semantic_key: str | None = None
+
+
+@dataclass(frozen=True)
+class FieldAudit:
+    visible_label: str
+    page_or_step: str | None
+    semantic_key: str | None
+    action: str
+    provenance: Provenance
+    verification: Verification
 
 
 @dataclass(frozen=True)
@@ -32,6 +43,8 @@ class WorkerOutcome:
     blocker: Blocker | None = None
     failure: FailureReason | None = None
     page_or_step: str | None = None
+    audits: tuple[FieldAudit, ...] = ()
+    report_persisted: bool = False
 
     def __post_init__(self) -> None:
         if self.kind is WorkerYield.HUMAN_BLOCKED and self.blocker is None:

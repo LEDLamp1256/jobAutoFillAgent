@@ -36,3 +36,12 @@ The fixture's current-employer answer is derived only when exactly one work
 history entry is explicitly marked current. General employment and education
 record identity remains deferred. V2-4 has no LLM, persistence, real
 application submission, or human approval UI.
+
+V2-11 adds an explicit `current_page_only=True` mode to this controller. It
+accepts the launcher's fresh application observation, fills safe text and
+choice fields even when final Submit is already visible, and checks each
+action against a fresh observation. Its final field decisions distinguish
+verified fills, unresolved questions, and manually present values. The worker
+persists those decisions and annotates only targets from the final observation.
+This mode never activates Advance or Submit. The original multi-step mode
+retains its previous behavior for its existing tests and tools.

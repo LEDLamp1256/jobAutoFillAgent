@@ -121,12 +121,21 @@ class ApplicationScheduler:
             if not isinstance(outcome, WorkerOutcome):
                 raise TypeError("worker must return WorkerOutcome")
             task = self.store.get_task(task.id)
-            for issue in outcome.issues:
-                self.store.add_report_entry(task.id, page_or_step=issue.page_or_step,
-                                            visible_label=issue.visible_label, semantic_key=None,
-                                            kind=ReportKind.FIELD, provenance=Provenance.UNRESOLVED,
-                                            action="deferred", verification=Verification.NOT_ATTEMPTED,
-                                            review_state=ReviewState.PENDING, reason=issue.reason)
+            if not outcome.report_persisted:
+                for audit in outcome.audits:
+                    self.store.add_report_entry_once(task.id, page_or_step=audit.page_or_step,
+                                                     visible_label=audit.visible_label,
+                                                     semantic_key=audit.semantic_key,
+                                                     kind=ReportKind.FIELD,
+                                                     provenance=audit.provenance, action=audit.action,
+                                                     verification=audit.verification,
+                                                     review_state=ReviewState.NOT_REQUIRED)
+                for issue in outcome.issues:
+                    self.store.add_report_entry_once(task.id, page_or_step=issue.page_or_step,
+                                                visible_label=issue.visible_label, semantic_key=issue.semantic_key,
+                                                kind=ReportKind.FIELD, provenance=Provenance.UNRESOLVED,
+                                                action="deferred", verification=Verification.NOT_ATTEMPTED,
+                                                review_state=ReviewState.PENDING, reason=issue.reason)
             if outcome.kind is WorkerYield.HUMAN_BLOCKED:
                 task = self.store.pause_for_human(task.id, outcome.blocker, page_or_step=outcome.page_or_step)
             elif outcome.kind is WorkerYield.READY_FOR_REVIEW:

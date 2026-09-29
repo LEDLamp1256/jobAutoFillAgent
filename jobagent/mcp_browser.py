@@ -42,6 +42,8 @@ _REQUIRED_SCHEMAS = {
     "browser_type": {"target", "text", "submit"},
     "browser_click": {"target"},
     "browser_close": set(),
+    "browser_evaluate": {"element", "target", "function"},
+    "browser_select_option": {"target", "values"},
 }
 
 
@@ -247,7 +249,15 @@ class PlaywrightMCPAdapter:
         assert self._last is not None
         target = self._last.option_targets.get((action.target_ref, action.answer.value))
         if target is None:
-            raise PermissionError("option has no current browser reference")
+            # A native select exposes its own current snapshot ref and visible
+            # options; browser_select_option is a narrow typed MCP operation.
+            question = next(q for q in before.questions if q.target_ref == action.target_ref)
+            if action.answer.value not in question.options or "browser_select_option" not in self.discovered_tools:
+                raise PermissionError("option has no current browser reference")
+            return await self._mutate("browser_select_option", {
+                "element": "observed choice field", "target": action.target_ref,
+                "values": [action.answer.value],
+            }, before)
         return await self._mutate("browser_click", {"target": target}, before)
 
     async def activate_navigation(self, action: Advance | GoBack,
@@ -256,6 +266,39 @@ class PlaywrightMCPAdapter:
             raise PermissionError("only typed non-submit navigation is exposed")
         before = self._check_action(action, session)
         return await self._mutate("browser_click", {"target": action.target_ref}, before)
+
+    async def annotate_field(self, target_ref: str, observation_id: str,
+                             state: str) -> None:
+        """Presentation only, addressed by one current snapshot ref."""
+        if state not in {"verified", "needs-review", "clear"}:
+            raise ValueError("unknown Job Agent annotation")
+        if self._last is None or self._last.observation.observation_id != observation_id:
+            raise PermissionError("annotation requires the current observation")
+        matches = [q for q in self._last.observation.questions if q.target_ref == target_ref]
+        if len(matches) != 1 or not target_ref:
+            raise PermissionError("annotation target is missing or ambiguous")
+        # Only the fixed enum is interpolated. The page label and value are never
+        # executable input. The site keeps its own inline style and field value.
+        function = """(element) => {
+          if (!element || !element.isConnected) return false;
+          let style = document.getElementById('jobagent-review-style');
+          if (!style) {
+            style = document.createElement('style');
+            style.id = 'jobagent-review-style';
+            style.textContent = '[data-jobagent-review-state="verified"] { outline: 3px solid #16803c !important; outline-offset: 2px !important; } [data-jobagent-review-state="needs-review"] { outline: 3px solid #c52222 !important; outline-offset: 2px !important; }';
+            document.head.appendChild(style);
+          }
+          if (STATE === 'clear') element.removeAttribute('data-jobagent-review-state');
+          else element.setAttribute('data-jobagent-review-state', STATE);
+          return true;
+        }""".replace("STATE", json.dumps(state))
+        result = await self._call("browser_evaluate", {
+            "element": "observed application field", "target": target_ref, "function": function,
+        })
+        content = "\n".join(item.text for item in result.content
+                            if getattr(item, "type", None) == "text")
+        if not re.search(r"(?m)^true\s*$", content):
+            raise MCPToolContractError("field annotation was not confirmed")
 
     def _login_observation(self, observation_id: str) -> ApplicationObservation:
         if self._last is None or self._last.observation.observation_id != observation_id:

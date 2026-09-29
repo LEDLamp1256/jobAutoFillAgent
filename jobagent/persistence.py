@@ -355,6 +355,31 @@ class BatchStore:
                 self._record_human_action(HumanActor.LOCAL_OWNER, human_action, "report_entry", entry.id)
         return entry
 
+    def add_report_entry_once(self, task_id: str, *, page_or_step: str | None,
+                              visible_label: str, semantic_key: str | None, kind: ReportKind,
+                              provenance: Provenance, action: str, verification: Verification,
+                              review_state: ReviewState, reason: str | None = None) -> ReportEntry:
+        """Reuse an equivalent audit row, including a still-pending review issue."""
+        for entry in self.get_report(task_id).entries:
+            if (action == "confirmed_trusted" and verification is Verification.VERIFIED and
+                    entry.verification is Verification.VERIFIED and
+                    entry.page_or_step == page_or_step and entry.visible_label == visible_label and
+                    entry.semantic_key == semantic_key and entry.provenance is provenance and
+                    entry.review_state is ReviewState.NOT_REQUIRED):
+                return entry
+            if verification is Verification.VERIFIED and action != "confirmed_trusted":
+                continue
+            if (entry.page_or_step, entry.visible_label, entry.semantic_key, entry.kind,
+                entry.provenance, entry.action, entry.verification, entry.review_state,
+                entry.reason) == (page_or_step, visible_label, semantic_key, kind,
+                                  provenance, action, verification, review_state, reason):
+                return entry
+        return self.add_report_entry(task_id, page_or_step=page_or_step,
+                                     visible_label=visible_label, semantic_key=semantic_key,
+                                     kind=kind, provenance=provenance, action=action,
+                                     verification=verification, review_state=review_state,
+                                     reason=reason)
+
     def review_entry_by_human(self, entry_id: str, *, authorization: HumanAuthorization) -> ReportEntry:
         actor = _require_human(authorization, HumanAction.REVIEW_ENTRY)
         row = self._one("SELECT * FROM report_entries WHERE id = ?", (entry_id,))

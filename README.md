@@ -23,9 +23,13 @@ required for autonomous scheduler ticks; opening the app does not create one.
 The SwiftUI app displays runs, applications, attention items, reports, and
 narrative entries. It supports Refresh, Reconnect Backend, explicit Resume,
 Bring Window to Front, report review, narrative review/replacement, and final
-review checkoff. The deterministic answer resolver and bounded local semantic
-fallback exist in Python, but the current V2-10 worker **stops at the
-application page**. It does not yet fill or traverse application pages.
+review checkoff. The V2-11 Python worker fills safe text and choice fields on
+the current application page using deterministic candidate facts. Freshly
+verified fields are marked green in Chrome; unresolved fields are marked red
+where the current browser observation safely identifies them. The colors show
+policy and review state, not a separate numeric confidence threshold. Pending
+questions appear in the durable report. A complete one-page form can reach
+`READY_FOR_REVIEW`; Next/Continue and final Submit remain human browser actions.
 Job discovery, LinkedIn/Handshake scraping, and general autonomous multi-page
 application navigation are not part of the current v2 app.
 
@@ -223,8 +227,9 @@ The answer-resolution components prefer deterministic, trusted candidate
 facts. A bounded local semantic fallback may map a question to a permitted
 semantic key, but cannot invent candidate values or receive passwords.
 Browser references are ephemeral, and browser changes require fresh
-observation. The current V2-10 worker connects the launcher and login boundary;
-general page filling and traversal remain future work. For deeper contracts,
+observation. The V2-11 worker adds bounded current-page filling and review
+annotation after the accepted launcher and login boundary; automated multi-page
+navigation remains future work. For deeper contracts,
 see [`docs/v2-foundation.md`](docs/v2-foundation.md),
 [`docs/v2-resolution.md`](docs/v2-resolution.md),
 [`docs/v2-semantic-llm.md`](docs/v2-semantic-llm.md),

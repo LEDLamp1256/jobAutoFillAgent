@@ -121,8 +121,8 @@ class ManagedRuntimeTests(unittest.TestCase):
         self.assertEqual(scheduler.step().task.id, a.id)
         first = self.store.get_task(a.id).browser_session_id
         self.assertEqual(self.windows.allocate(a.id), first)
-        # V2-10 yields at the application page. Pause it to let the next task run.
-        self.store.pause_for_human(a.id, Blocker.OTHER)
+        # V2-11 current-page work yields HUMAN_PAUSED for the unknown field.
+        self.assertEqual(self.store.get_task(a.id).status, TaskStatus.HUMAN_PAUSED)
         self.assertEqual(scheduler.step().task.id, b.id)
         second = self.store.get_task(b.id).browser_session_id
         self.assertNotEqual(first, second)
@@ -162,6 +162,8 @@ class ManagedRuntimeTests(unittest.TestCase):
         restarted_windows = MCPManagedWindows(lambda: MCPServerCommand("node", ("mcp.js",)), factory)
         try:
             self.assertFalse(restarted_windows.exists(old))
+            self.store.resume_by_human(task.id, authorization=HumanAuthorization(
+                HumanActor.LOCAL_OWNER, HumanAction.RESUME))
             restarted = ApplicationScheduler(
                 self.store,
                 LaunchAndLoginWorker(self.store, ApplicationLauncher(restarted_windows),
@@ -240,7 +242,7 @@ class ManagedRuntimeTests(unittest.TestCase):
         task = self.queue()
         result = self.scheduler(config).step()
         self.assertEqual((result.task.status, result.outcome.kind.value),
-                         (TaskStatus.FILLING, "progress"))
+                         (TaskStatus.HUMAN_PAUSED, "human_blocked"))
         self.assertEqual(self.browsers[0].calls,
                          [("identity", "e2"), ("password", "e3"), ("sign_in", "e4")])
         self.assertNotIn(SECRET, repr(result))
@@ -367,7 +369,7 @@ class ManagedRuntimeTests(unittest.TestCase):
         scheduler = self.scheduler()
         scheduler.step()
         first = self.store.get_task(a.id).browser_session_id
-        self.store.pause_for_human(a.id, Blocker.OTHER)
+        self.assertEqual(self.store.get_task(a.id).status, TaskStatus.HUMAN_PAUSED)
         scheduler.step()
         second = self.store.get_task(b.id).browser_session_id
         self.browsers[0].tab_count = 2
@@ -441,6 +443,8 @@ output = Path(sys.argv[sys.argv.index('--output-dir') + 1])
         scheduler.step()
         window_id = self.store.get_task(task.id).browser_session_id
         self.browsers[0].tab_count = 2
+        self.store.resume_by_human(task.id, authorization=HumanAuthorization(
+            HumanActor.LOCAL_OWNER, HumanAction.RESUME))
         result = scheduler.step()
         self.assertEqual((result.task.status, result.task.blocker),
                          (TaskStatus.HUMAN_PAUSED, Blocker.OTHER))
