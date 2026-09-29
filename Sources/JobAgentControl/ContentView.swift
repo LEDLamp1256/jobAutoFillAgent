@@ -115,7 +115,7 @@ private struct StatusBadge: View {
     let application: ApplicationDTO
 
     var body: some View {
-        Text(application.status.replacingOccurrences(of: "_", with: " ").uppercased())
+        Text(application.statusLabel)
             .font(.caption2.weight(.semibold))
             .padding(.horizontal, 7).padding(.vertical, 4)
             .background(application.needsAttention ? Color.orange.opacity(0.2) : Color.secondary.opacity(0.12))
@@ -126,6 +126,7 @@ private struct StatusBadge: View {
 private struct ApplicationDetail: View {
     @ObservedObject var store: AppStore
     let application: ApplicationDTO
+    @State private var showingSubmissionConfirmation = false
 
     var body: some View {
         ScrollView {
@@ -211,11 +212,28 @@ private struct ApplicationDetail: View {
                 }
                 Text("Final review complete does not submit the application.")
                     .font(.caption).foregroundStyle(.secondary)
+                if application.recordSubmissionAvailable {
+                    Button("Record as Submitted") {
+                        showingSubmissionConfirmation = true
+                    }
+                    Text("Use this only after manually submitting on the employer website.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }
             .padding(20)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .navigationTitle("Application")
+        .confirmationDialog("Record application as submitted?",
+                            isPresented: $showingSubmissionConfirmation,
+                            titleVisibility: .visible) {
+            Button("Record as Submitted") {
+                Task { await store.recordSubmission(application.id) }
+            }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("Only continue after you have manually submitted this application on the employer's website. Job Application Agent will record it as submitted but will not click Submit for you.")
+        }
     }
 }
 

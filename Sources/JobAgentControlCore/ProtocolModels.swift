@@ -29,8 +29,10 @@ public struct ApplicationDTO: Codable, Identifiable, Equatable, Sendable {
     public let windowAvailable: Bool
     public let resumeAvailable: Bool
     public let readyForReview: Bool
+    public let reviewPhase: String?
     public let finalReviewAvailable: Bool
     public let finalReviewChecked: Bool
+    public let recordSubmissionAvailable: Bool
     public let pendingReviewCount: Int
     public let pendingNarrativeCount: Int
     public let createdAt: String
@@ -38,6 +40,15 @@ public struct ApplicationDTO: Codable, Identifiable, Equatable, Sendable {
 
     public var id: String { taskId }
     public var needsAttention: Bool { attentionCategory != nil }
+    public var statusLabel: String {
+        switch reviewPhase {
+        case "needs_review": "Needs Review"
+        case "ready_for_final_review": "Ready for Final Review"
+        case "ready_to_submit": "Ready to Submit"
+        case "submitted": "Submitted"
+        default: status.replacingOccurrences(of: "_", with: " ").uppercased()
+        }
+    }
 }
 
 public struct ReportEntryDTO: Codable, Identifiable, Equatable, Sendable {
@@ -92,6 +103,7 @@ public enum ControlOperation: Equatable, Sendable {
     case bringWindowToFront(String)
     case reviewReportEntry(String)
     case markFinalReviewChecked(String)
+    case recordSubmission(String)
     case replaceNarrative(entryID: String, text: String)
 
     public var method: String {
@@ -107,6 +119,7 @@ public enum ControlOperation: Equatable, Sendable {
         case .bringWindowToFront: "bring_window_to_front"
         case .reviewReportEntry: "review_report_entry"
         case .markFinalReviewChecked: "mark_final_review_checked"
+        case .recordSubmission: "record_submission"
         case .replaceNarrative: "replace_narrative"
         }
     }
@@ -119,7 +132,8 @@ public enum ControlOperation: Equatable, Sendable {
             id.map { ["run_id": $0] } ?? [:]
         case .getApplication(let id), .getApplicationReport(let id),
              .getNarrativeEntries(let id), .resumeApplication(let id),
-             .bringWindowToFront(let id), .markFinalReviewChecked(let id):
+             .bringWindowToFront(let id), .markFinalReviewChecked(let id),
+             .recordSubmission(let id):
             ["task_id": id]
         case .reviewReportEntry(let id): ["entry_id": id]
         case .replaceNarrative(let id, let text): ["entry_id": id, "text": text]

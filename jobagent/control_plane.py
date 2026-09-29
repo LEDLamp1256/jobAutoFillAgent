@@ -65,6 +65,16 @@ class LocalControlPlane:
         else:
             window_available = self.scheduler.windows.exists(window_id)
         pending_review_count = sum(e.review_state is ReviewState.PENDING for e in report.entries)
+        review_phase = None
+        if task.status is TaskStatus.SUBMITTED_BY_HUMAN:
+            review_phase = "submitted"
+        elif task.status is TaskStatus.READY_FOR_REVIEW:
+            if pending_review_count:
+                review_phase = "needs_review"
+            elif task.review_checked_at is None:
+                review_phase = "ready_for_final_review"
+            else:
+                review_phase = "ready_to_submit"
         return {
             "task_id": task.id, "run_id": task.run_id,
             "listing_id": listing.id, "company": listing.company, "title": listing.title,
@@ -79,9 +89,13 @@ class LocalControlPlane:
             "resume_available": task.status is TaskStatus.HUMAN_PAUSED and
                                 task.ownership is Ownership.HUMAN_OWNED,
             "ready_for_review": task.status is TaskStatus.READY_FOR_REVIEW,
+            "review_phase": review_phase,
             "final_review_available": task.status is TaskStatus.READY_FOR_REVIEW and
                                       pending_review_count == 0 and task.review_checked_at is None,
             "final_review_checked": task.review_checked_at is not None,
+            "record_submission_available": review_phase == "ready_to_submit" and
+                                           task.ownership is Ownership.HUMAN_OWNED and
+                                           task.review_checked_by is not None,
             "pending_review_count": pending_review_count,
             "pending_narrative_count": sum(e.kind is ReportKind.NARRATIVE and
                                            e.review_state is ReviewState.PENDING for e in report.entries),
@@ -130,6 +144,11 @@ class LocalControlPlane:
 
     def mark_final_review_checked(self, task_id: str) -> dict:
         self.store.mark_review_checked(task_id, authorization=self._owner(HumanAction.FINAL_REVIEW))
+        return self.get_application(task_id)
+
+    def record_submission(self, task_id: str) -> dict:
+        self.store.mark_submitted_by_human(
+            task_id, authorization=self._owner(HumanAction.RECORD_SUBMISSION))
         return self.get_application(task_id)
 
     def replace_narrative(self, entry_id: str, text: str) -> dict:

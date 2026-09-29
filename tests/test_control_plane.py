@@ -15,7 +15,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from jobagent.batch_domain import (
-    Blocker, HumanAction, Ownership, Provenance, ReportKind, ReviewState, RunStatus,
+    Blocker, HumanAction, HumanActor, HumanAuthorization, Ownership, Provenance, ReportKind, ReviewState, RunStatus,
     TaskStatus, Verification,
 )
 from jobagent.application_worker import WorkerOutcome, WorkerYield
@@ -155,6 +155,92 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(len(outgoing.getvalue().splitlines()), 4)
         self.assertEqual(self.windows.by_task, {})
         self.assertEqual(self.windows.front, [])
+        self.assertEqual(self.store.human_actions("task", task.id), ())
+
+    def test_review_phase_and_owner_recorded_submission(self):
+        task = self.queue("Review phases")
+        window_id = self.windows.allocate(task.id)
+        self.store.start(task.id, browser_session_id=window_id)
+        self.store.add_report_entry(
+            task.id, page_or_step="page 1", visible_label="First name",
+            semantic_key="personal.first_name", kind=ReportKind.FIELD,
+            provenance=Provenance.VERIFIED_PROFILE, action="filled_text",
+            verification=Verification.VERIFIED, review_state=ReviewState.NOT_REQUIRED)
+        pending = self.store.add_report_entry(
+            task.id, page_or_step="page 1", visible_label="Fixture clearance code",
+            semantic_key=None, kind=ReportKind.FIELD,
+            provenance=Provenance.UNRESOLVED, action="deferred",
+            verification=Verification.NOT_ATTEMPTED, review_state=ReviewState.PENDING,
+            reason="no_safe_answer")
+        self.store.ready_for_review(task.id)
+        initial = self.request("get_application", {"task_id": task.id})["result"]
+        self.assertEqual(initial["review_phase"], "needs_review")
+        self.assertFalse(initial["record_submission_available"])
+        self.assertEqual(self.request("record_submission", {"task_id": task.id})["error"]["code"],
+                         "INVALID_TRANSITION")
+        self.assertEqual(self.request("review_report_entry", {"entry_id": pending.id})["result"]["review_state"],
+                         "approved")
+        after_item = self.request("get_application", {"task_id": task.id})["result"]
+        self.assertEqual(after_item["review_phase"], "ready_for_final_review")
+        self.assertFalse(after_item["record_submission_available"])
+        self.assertEqual(self.request("record_submission", {"task_id": task.id})["error"]["code"],
+                         "INVALID_TRANSITION")
+        checked = self.request("mark_final_review_checked", {"task_id": task.id})["result"]
+        self.assertEqual(checked["review_phase"], "ready_to_submit")
+        self.assertTrue(checked["record_submission_available"])
+        self.assertEqual(checked["status"], "ready_for_review")
+        before_report = self.store.get_report(task.id)
+        self.assertEqual(self.request("record_submission", {"task_id": task.id,
+                                                            "actor": "local_owner"})["error"]["code"],
+                         "BAD_REQUEST")
+        self.assertEqual(self.request("record_submission", {"task_id": task.id,
+                                                            "action": "record_submission"})["error"]["code"],
+                         "BAD_REQUEST")
+        self.assertEqual(self.request("record_submission")["error"]["code"], "BAD_REQUEST")
+        self.assertFalse(self.request("record_submission", {"task_id": task.id, "text": "Submit"})["ok"])
+        submitted = self.request("record_submission", {"task_id": task.id})["result"]
+        durable = self.store.get_task(task.id)
+        self.assertEqual((submitted["status"], submitted["review_phase"]),
+                         ("submitted_by_human", "submitted"))
+        self.assertEqual(durable.status, TaskStatus.SUBMITTED_BY_HUMAN)
+        self.assertEqual(durable.ownership, Ownership.HUMAN_OWNED)
+        self.assertIsNotNone(durable.submitted_at)
+        self.assertEqual(durable.submitted_by, HumanActor.LOCAL_OWNER.value)
+        self.assertFalse(submitted["record_submission_available"])
+        self.assertFalse(submitted["resume_available"])
+        self.assertFalse(submitted["final_review_available"])
+        self.assertEqual(self.store.get_report(task.id), before_report)
+        self.assertEqual(self.store.human_actions("task", task.id)[-1].action,
+                         HumanAction.RECORD_SUBMISSION)
+        self.assertEqual(self.request("list_attention_required")["result"], [])
+        self.assertEqual(self.request("list_applications")["result"][0]["task_id"], task.id)
+        self.assertTrue(self.request("bring_window_to_front", {"task_id": task.id})["ok"])
+        self.assertEqual(self.windows.front, [window_id])
+        self.assertEqual(self.request("record_submission", {"task_id": task.id})["error"]["code"],
+                         "INVALID_TRANSITION")
+        self.assertEqual(self.request("resume_application", {"task_id": task.id})["error"]["code"],
+                         "NOT_RESUMABLE")
+
+    def test_submission_rejects_other_statuses_and_wrong_authorization(self):
+        queued = self.queue("Queued")
+        self.assertIsNone(self.request("get_application", {"task_id": queued.id})["result"]["review_phase"])
+        self.assertEqual(self.request("record_submission", {"task_id": queued.id})["error"]["code"],
+                         "INVALID_TRANSITION")
+        paused = self.queue("Paused")
+        self.pause(paused)
+        self.assertIsNone(self.request("get_application", {"task_id": paused.id})["result"]["review_phase"])
+        self.assertEqual(self.request("record_submission", {"task_id": paused.id})["error"]["code"],
+                         "INVALID_TRANSITION")
+        ready = self.queue("Ready")
+        self.store.start(ready.id, browser_session_id=self.windows.allocate(ready.id))
+        self.store.ready_for_review(ready.id)
+        with self.assertRaises(PermissionError):
+            self.store.mark_submitted_by_human(ready.id, authorization=None)
+        with self.assertRaises(PermissionError):
+            self.store.mark_submitted_by_human(ready.id, authorization=HumanAuthorization(
+                HumanActor.LOCAL_OWNER, HumanAction.FINAL_REVIEW))
+        self.assertEqual(self.request("record_submission", {"task_id": ready.id})["error"]["code"],
+                         "INVALID_TRANSITION")
 
     def test_only_persisted_running_batch_progresses_on_idle_tick(self):
         task = self.queue("Running")

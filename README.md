@@ -22,8 +22,8 @@ required for autonomous scheduler ticks; opening the app does not create one.
 
 The SwiftUI app displays runs, applications, attention items, reports, and
 narrative entries. It supports Refresh, Reconnect Backend, explicit Resume,
-Bring Window to Front, report review, narrative review/replacement, and final
-review checkoff. The V2-11 Python worker fills safe text and choice fields on
+Bring Window to Front, report review, narrative review/replacement, final
+review checkoff, and owner-recorded submission. The V2-11 Python worker fills safe text and choice fields on
 the current application page using deterministic candidate facts. Freshly
 verified fields are marked green in Chrome; unresolved fields are marked red
 where the current browser observation safely identifies them. The colors show
@@ -149,6 +149,11 @@ Missing configuration is safe: ordinary login will pause for human handling.
   automation. It does not replay a previous browser action.
 - Use report review and narrative review/replacement to record human decisions.
   Final-review checkoff records review; it does **not** submit the application.
+- The review labels progress from **Needs Review** through **Ready for Final
+  Review** and **Ready to Submit**. After manually submitting on the employer
+  site, use **Record as Submitted** and confirm to record that fact locally.
+  This action does not click the site's Submit button. The managed browser
+  remains available if its runtime is still alive.
 - **Reconnect Backend** restarts the local Python child and reloads durable
   state. It does not replay owner commands. Merely reconnecting does not create
   a new `RUNNING` batch.

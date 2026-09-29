@@ -35,6 +35,7 @@ _PARAMETERS = {
     "bring_window_to_front": (frozenset({"task_id"}), frozenset()),
     "review_report_entry": (frozenset({"entry_id"}), frozenset()),
     "mark_final_review_checked": (frozenset({"task_id"}), frozenset()),
+    "record_submission": (frozenset({"task_id"}), frozenset()),
     "replace_narrative": (frozenset({"entry_id", "text"}), frozenset()),
 }
 
@@ -82,6 +83,7 @@ def dispatch(request: object, control: LocalControlPlane) -> dict:
             "bring_window_to_front": control.bring_window_to_front,
             "review_report_entry": control.review_report_entry,
             "mark_final_review_checked": control.mark_final_review_checked,
+            "record_submission": control.record_submission,
             "replace_narrative": control.replace_narrative,
         }
         return {"id": request_id, "ok": True, "result": operations[method](**params)}
