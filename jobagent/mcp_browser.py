@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+import os
 from pathlib import Path
+import re
 from typing import Callable
 
 from mcp import Client
-from mcp.client.stdio import StdioServerParameters
+from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from jobagent.browser import BrowserActionResult
 from jobagent.domain import (
@@ -84,6 +87,7 @@ class PlaywrightMCPAdapter:
         self._client_factory = client_factory
         self._client_context = None
         self._client = None
+        self._server_stderr = None
         self._last: NormalizedSnapshot | None = None
         self._observation_counter = 0
         self.discovered_tools: tuple[str, ...] = ()
@@ -92,9 +96,13 @@ class PlaywrightMCPAdapter:
         parameters = StdioServerParameters(
             command=self._server.command, args=list(self._server.args), cwd=self._server.cwd,
         )
-        self._client_context = self._client_factory(parameters)
-        self._client = await self._client_context.__aenter__()
         try:
+            # MCP tool arguments include login credentials. Never inherit raw
+            # server stderr into the backend or SwiftUI diagnostic stream.
+            self._server_stderr = open(os.devnull, "w", encoding="utf-8")
+            transport = stdio_client(parameters, errlog=self._server_stderr)
+            self._client_context = self._client_factory(transport)
+            self._client = await self._client_context.__aenter__()
             result = await self._client.list_tools()
             validate_tool_contract(result.tools)
             self.discovered_tools = tuple(tool.name for tool in result.tools)
@@ -111,12 +119,20 @@ class PlaywrightMCPAdapter:
         self._client_context = self._client = None
         self._last = None
         if context is None:
+            if self._server_stderr is not None:
+                self._server_stderr.close()
+                self._server_stderr = None
             return
         try:
             if client is not None and "browser_close" in self.discovered_tools:
                 await client.call_tool("browser_close", {})
         finally:
-            await context.__aexit__(None, None, None)
+            try:
+                await context.__aexit__(None, None, None)
+            finally:
+                if self._server_stderr is not None:
+                    self._server_stderr.close()
+                    self._server_stderr = None
 
     async def _call(self, name: str, arguments: dict) -> object:
         if self._client is None:
@@ -131,6 +147,47 @@ class PlaywrightMCPAdapter:
         self._last = None
         await self._call("browser_navigate", {"url": url})
         return await self.observe()
+
+    async def managed_tabs(self) -> str:
+        """Read the live MCP tab list; never use its text as a persisted identity."""
+        if "browser_tabs" not in self.discovered_tools:
+            raise MCPToolContractError("Playwright MCP tab management is unavailable")
+        result = await self._call("browser_tabs", {"action": "list"})
+        return "\n".join(item.text for item in result.content
+                         if getattr(item, "type", None) == "text")
+
+    async def _page_marker(self, expression: str) -> object:
+        if "browser_evaluate" not in self.discovered_tools:
+            raise MCPToolContractError("Playwright MCP page identity is unavailable")
+        result = await self._call("browser_evaluate", {"function": expression})
+        response = "\n".join(item.text for item in result.content
+                             if getattr(item, "type", None) == "text")
+        match = re.search(r"(?ms)^### Result\n(.*?)(?=^### |\Z)", response)
+        if match is None:
+            raise MCPToolContractError("Playwright MCP page identity result is unavailable")
+        try:
+            return json.loads(match.group(1).strip())
+        except json.JSONDecodeError:
+            raise MCPToolContractError("Playwright MCP page identity result is invalid") from None
+
+    async def set_managed_page_token(self, token: str) -> None:
+        key = json.dumps("jobagent-v2-managed-page")
+        value = json.dumps(token)
+        result = await self._page_marker(
+            f"() => {{ sessionStorage.setItem({key}, {value}); return true; }}")
+        if result is not True:
+            raise MCPToolContractError("managed page identity could not be established")
+
+    async def managed_page_token_matches(self, token: str) -> bool:
+        key = json.dumps("jobagent-v2-managed-page")
+        value = json.dumps(token)
+        return await self._page_marker(
+            f"() => sessionStorage.getItem({key}) === {value}") is True
+
+    async def bring_managed_tab_to_front(self) -> None:
+        # Each managed adapter owns one isolated browser. Tab selection is an
+        # explicit foreground action, never part of observation or lookup.
+        await self._call("browser_tabs", {"action": "select", "index": 0})
 
     async def observe(self) -> ApplicationObservation:
         result = await self._call("browser_snapshot", {})

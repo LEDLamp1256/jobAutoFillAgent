@@ -56,7 +56,14 @@ class LocalControlPlane:
         listing = self.store.get_listing(task.job_listing_id)
         report = self.store.get_report(task.id)
         window_id = self.scheduler.windows.window_for_task(task.id)
-        window_available = window_id is not None and self.scheduler.windows.exists(window_id)
+        # MCP browser_tabs/list may create a blank tab when none remain. Passive
+        # views use only process-local knowledge; Bring validates the live page.
+        if window_id is None:
+            window_available = False
+        elif hasattr(self.scheduler.windows, "passive_available"):
+            window_available = self.scheduler.windows.passive_available(window_id)
+        else:
+            window_available = self.scheduler.windows.exists(window_id)
         pending_review_count = sum(e.review_state is ReviewState.PENDING for e in report.entries)
         return {
             "task_id": task.id, "run_id": task.run_id,

@@ -2,19 +2,25 @@
 
 import io
 import json
+import argparse
+import os
 import select
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from jobagent.batch_domain import (
-    Blocker, HumanAction, Ownership, Provenance, ReportKind, ReviewState,
+    Blocker, HumanAction, Ownership, Provenance, ReportKind, ReviewState, RunStatus,
     TaskStatus, Verification,
 )
+from jobagent.application_worker import WorkerOutcome, WorkerYield
 from jobagent.control_plane import LocalControlPlane
-from jobagent.control_plane_stdio import dispatch, handle_line, serve
+from jobagent.control_plane_stdio import _run_backend, dispatch, handle_line, progress_running_batch, serve
 from jobagent.dedupe import ListingInput
 from jobagent.persistence import BatchStore
 from jobagent.scheduler import ApplicationScheduler
@@ -44,6 +50,15 @@ class Windows:
 
     def bring_to_front(self, window_id):
         self.front.append(window_id)
+
+
+class ProgressWorker:
+    def __init__(self):
+        self.calls = []
+
+    def work_until_yield(self, request):
+        self.calls.append(request.task.id)
+        return WorkerOutcome(WorkerYield.PROGRESS)
 
 
 class ControlPlaneTests(unittest.TestCase):
@@ -122,6 +137,106 @@ class ControlPlaneTests(unittest.TestCase):
         self.windows.release(self.windows.by_task[a.id])
         self.assertEqual(self.request("bring_window_to_front", {"task_id": a.id})["error"]["code"],
                          "WINDOW_UNAVAILABLE")
+
+    def test_passive_request_service_does_not_call_scheduler_step(self):
+        task = self.queue("Passive")
+        def forbidden_step(*_args, **_kwargs):
+            raise AssertionError("passive request called scheduler.step")
+        self.control.scheduler.step = forbidden_step
+        requests = [
+            {"id": "1", "method": "list_runs", "params": {}},
+            {"id": "2", "method": "list_applications", "params": {}},
+            {"id": "3", "method": "get_application", "params": {"task_id": task.id}},
+            {"id": "4", "method": "list_attention_required", "params": {}},
+        ]
+        incoming = io.StringIO("".join(json.dumps(request) + "\n" for request in requests))
+        outgoing = io.StringIO()
+        serve(incoming, outgoing, self.control)
+        self.assertEqual(len(outgoing.getvalue().splitlines()), 4)
+        self.assertEqual(self.windows.by_task, {})
+        self.assertEqual(self.windows.front, [])
+
+    def test_only_persisted_running_batch_progresses_on_idle_tick(self):
+        task = self.queue("Running")
+        worker = ProgressWorker()
+        scheduler = ApplicationScheduler(self.store, worker, self.windows,
+                                         max_open_applications=3)
+        completed = set()
+        progress_running_batch(self.store, scheduler, completed)
+        self.assertEqual((worker.calls, self.windows.by_task), ([], {}))
+        self.store.set_run_status(self.run.id, RunStatus.RUNNING)
+        progress_running_batch(self.store, scheduler, completed)
+        self.assertEqual(worker.calls, [task.id])
+        self.assertEqual(self.store.get_task(task.id).status, TaskStatus.LAUNCHING)
+        progress_running_batch(self.store, scheduler, completed)
+        self.assertEqual(worker.calls, [task.id])
+        self.assertEqual(self.windows.front, [])
+
+    def test_human_paused_and_ready_for_review_are_not_idle_candidates(self):
+        task = self.queue("Paused")
+        self.store.set_run_status(self.run.id, RunStatus.RUNNING)
+        self.pause(task)
+        worker = ProgressWorker()
+        scheduler = ApplicationScheduler(self.store, worker, self.windows,
+                                         max_open_applications=3)
+        progress_running_batch(self.store, scheduler, set())
+        self.assertEqual(worker.calls, [])
+        self.store.resume_by_human(task.id,
+            authorization=self.control._owner(HumanAction.RESUME))
+        self.store.start(task.id, browser_session_id="review-window")
+        self.store.ready_for_review(task.id)
+        progress_running_batch(self.store, scheduler, set())
+        self.assertEqual(worker.calls, [])
+
+    def test_backend_eof_runs_managed_runtime_cleanup(self):
+        class ClosingWindows(Windows):
+            def __init__(self):
+                super().__init__()
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        cli = self.path.parent / "synthetic-cli.js"
+        cli.write_text("// never executed: no RUNNING batch")
+        windows = ClosingWindows()
+        reader, writer = os.pipe()
+        os.close(writer)
+        with os.fdopen(reader, "r") as input_stream, patch(
+                "jobagent.control_plane_stdio.MCPManagedWindows", return_value=windows), patch(
+                "jobagent.control_plane_stdio.shutil.which", return_value="node"), patch(
+                "jobagent.control_plane_stdio.sys.stdin", input_stream), patch(
+                "jobagent.control_plane_stdio.sys.stdout", io.StringIO()):
+            _run_backend(argparse.Namespace(db=self.path, config="missing.json",
+                                            mcp_cli=str(cli), max_open_applications=3))
+        self.assertTrue(windows.closed)
+        self.assertEqual(windows.by_task, {})
+
+    @unittest.skipUnless(shutil.which("node"), "Node is required for configured backend startup")
+    def test_configured_backend_sigterm_exits_through_cleanup(self):
+        cli = self.path.parent / "synthetic-cli.js"
+        cli.write_text("// never executed: no RUNNING batch")
+        child = subprocess.Popen(
+            [sys.executable, "-m", "jobagent.control_plane_stdio", "--db", str(self.path),
+             "--mcp-cli", str(cli)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True)
+        try:
+            child.stdin.write('{"id":"1","method":"list_runs","params":{}}\n')
+            child.stdin.flush()
+            ready, _, _ = select.select([child.stdout], [], [], 5)
+            self.assertTrue(ready)
+            self.assertTrue(json.loads(child.stdout.readline())["ok"])
+            child.send_signal(signal.SIGTERM)
+            self.assertEqual(child.wait(timeout=5), 0)
+            self.assertEqual(child.stdout.read(), "")
+            self.assertEqual(child.stderr.read(), "")
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=5)
+            child.stdin.close()
+            child.stdout.close()
+            child.stderr.close()
 
     def test_narrative_review_checkoff_and_no_submit(self):
         a = self.queue("Gamma")

@@ -1,4 +1,9 @@
 import unittest
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 
 from jobagent.domain import (
@@ -64,6 +69,21 @@ class FakeClient:
 
 
 class AdapterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_page_marker_uses_bounded_evaluation_result(self):
+        class MarkerClient(FakeClient):
+            async def call_tool(self, name, args):
+                self.calls.append((name, args))
+                if name == "browser_evaluate":
+                    return SimpleNamespace(is_error=False, content=[
+                        SimpleNamespace(type="text", text="### Result\ntrue")])
+                return SimpleNamespace(is_error=False, content=[])
+        fake = MarkerClient(None, tools=TOOLS + [tool("browser_evaluate", {"function"})])
+        async with PlaywrightMCPAdapter(MCPServerCommand("node", ("cli.js",)),
+                                        client_factory=lambda _: fake) as adapter:
+            await adapter.set_managed_page_token("synthetic-page-token")
+            self.assertTrue(await adapter.managed_page_token_matches("synthetic-page-token"))
+        self.assertEqual([name for name, _ in fake.calls].count("browser_evaluate"), 2)
+
     async def test_login_actions_are_typed_reobserved_and_not_routine_submit(self):
         fake = FakeClient(None, snapshots=[LOGIN, LOGIN, LOGIN, STEP_1])
         async with PlaywrightMCPAdapter(MCPServerCommand("node", ("cli.js",)),
@@ -172,6 +192,38 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(MCPToolContractError):
             await adapter.__aenter__()
         self.assertTrue(fake.closed)
+
+
+class MCPStderrBoundaryTests(unittest.TestCase):
+    def test_mcp_process_stderr_cannot_echo_synthetic_secret(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            server = Path(temporary) / "server.py"
+            server.write_text("""import sys
+from mcp.server.mcpserver import MCPServer
+server = MCPServer('synthetic-stderr-server')
+@server.tool()
+def echo(text: str) -> str:
+    print(text, file=sys.stderr, flush=True)
+    return 'received'
+server.run()
+""")
+            client = Path(temporary) / "client.py"
+            client.write_text("""import asyncio
+import sys
+import jobagent.mcp_browser as browser_module
+from jobagent.mcp_browser import MCPServerCommand, PlaywrightMCPAdapter
+browser_module.validate_tool_contract = lambda tools: None
+async def main():
+    async with PlaywrightMCPAdapter(MCPServerCommand(sys.executable, (sys.argv[1],))) as browser:
+        await browser._call('echo', {'text': sys.argv[2]})
+asyncio.run(main())
+""")
+            sentinel = "synthetic-mcp-stderr-sentinel-02"
+            result = subprocess.run([sys.executable, str(client), str(server), sentinel],
+                                    capture_output=True, text=True, timeout=25,
+                                    env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn(sentinel, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

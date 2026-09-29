@@ -55,7 +55,9 @@ def classify_page(observation: ApplicationObservation) -> PageState:
                          InterventionReason.EMAIL_VERIFICATION_REQUIRED)
     if any(term in combined for term in ("mfa", "two-factor", "two factor", "authenticator",
                                          "one-time code", "verification code", "security code",
-                                         "push approval", "device confirmation")):
+                                         "push approval", "device confirmation", "approve sign in",
+                                         "qr code", "scan this code", "security question",
+                                         "recovery code", "account recovery", "verify your identity")):
         return PageState(PageKind.HUMAN_INTERVENTION_REQUIRED, InterventionReason.MFA_REQUIRED)
     if any(term in controls for term in ("continue with google", "continue with microsoft",
                                          "continue with okta", "single sign-on", "sign in with sso")):
@@ -88,6 +90,7 @@ class LoginIdentity:
 
 
 class CredentialProvider(Protocol):
+    def destination_is_authorized(self, location: str, identity: LoginIdentity) -> bool: ...
     async def get_password(self, account_id: str) -> str | None: ...
 
 
@@ -130,9 +133,9 @@ class LoginOrchestrator:
             return LoginResult(LoginStatus.UNKNOWN, observation)
         if not identity.account_id.strip() or not identity.username.strip():
             return LoginResult(LoginStatus.CREDENTIALS_UNAVAILABLE, observation)
-        password = await self.credentials.get_password(identity.account_id)
-        if not password:
-            return LoginResult(LoginStatus.CREDENTIALS_UNAVAILABLE, observation)
+        if not self.credentials.destination_is_authorized(observation.location, identity):
+            return LoginResult(LoginStatus.HUMAN_INTERVENTION_REQUIRED, observation,
+                               InterventionReason.HUMAN_JUDGMENT_REQUIRED)
         try:
             # Reclassify after every action: no pre-action browser reference survives.
             observation = await self.browser.fill_login_identity(
@@ -140,6 +143,14 @@ class LoginOrchestrator:
             state = classify_page(observation)
             if state.kind is not PageKind.LOGIN or state.login is None:
                 return self._post_action(state, observation)
+            # Username entry may redirect. Re-authorize the observed destination
+            # before even reading the password from local configuration.
+            if not self.credentials.destination_is_authorized(observation.location, identity):
+                return LoginResult(LoginStatus.HUMAN_INTERVENTION_REQUIRED, observation,
+                                   InterventionReason.HUMAN_JUDGMENT_REQUIRED)
+            password = await self.credentials.get_password(identity.account_id)
+            if not password:
+                return LoginResult(LoginStatus.CREDENTIALS_UNAVAILABLE, observation)
             observation = await self.browser.fill_login_password(
                 state.login.password_ref, observation.observation_id, password)
             state = classify_page(observation)

@@ -4,12 +4,23 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+from pathlib import Path
+import selectors
+import signal
+import shutil
 import sys
+import time
 from typing import TextIO
 
 from .control_plane import ControlPlaneError, LocalControlPlane
+from .batch_domain import RunStatus, TaskStatus
 from .persistence import BatchStore
 from .scheduler import ApplicationScheduler
+from .application_launcher import ApplicationLauncher
+from .managed_runtime import MCPManagedWindows
+from .mcp_browser import MCPServerCommand
+from .runtime_worker import LaunchAndLoginWorker, LocalLoginConfiguration
 
 
 _PARAMETERS = {
@@ -101,8 +112,27 @@ def serve(input_stream: TextIO, output_stream: TextIO, control: LocalControlPlan
         output_stream.flush()
 
 
+def progress_running_batch(store: BatchStore, scheduler: ApplicationScheduler,
+                           completed_passes: set[tuple[str, str | None]]) -> None:
+    """Idle automation tick, authorized only by an existing durable RUNNING run."""
+    for run in store.list_runs():
+        if run.status is not RunStatus.RUNNING:
+            continue
+        active = [task for task in scheduler.tasks(run.id) if task.status in {
+            TaskStatus.LAUNCHING, TaskStatus.AUTHENTICATING,
+            TaskStatus.FILLING, TaskStatus.ADVANCING}]
+        if active and (active[0].id, active[0].resume_requested_at) in completed_passes:
+            continue
+        step = scheduler.step(run.id)
+        if step and step.outcome.kind.value == "progress":
+            completed_passes.add((step.task.id, step.task.resume_requested_at))
+        if step:
+            # One worker invocation per idle tick across all runs.
+            return
+
+
 class _UnavailableWindows:
-    """Pre-window-integration runtime: persisted IDs never imply live windows."""
+    """Safe fallback when no browser runtime was configured."""
 
     def open_count(self) -> int:
         return 0
@@ -131,11 +161,58 @@ class _UnavailableWorker:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Local Job Agent control plane over JSON lines")
     parser.add_argument("--db", required=True, help="local SQLite database path")
+    parser.add_argument("--config", default="config.json", help="gitignored local configuration path")
+    parser.add_argument("--mcp-cli", default=os.environ.get("JOB_AGENT_PLAYWRIGHT_MCP_CLI"),
+                        help="installed Playwright MCP CLI path")
+    parser.add_argument("--max-open-applications", type=int, default=3)
     args = parser.parse_args()
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGTERM, lambda _signum, _frame: sys.exit(0))
+    try:
+        _run_backend(args)
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
+
+
+def _run_backend(args: argparse.Namespace) -> None:
     with BatchStore(args.db) as store:
-        scheduler = ApplicationScheduler(store, _UnavailableWorker(), _UnavailableWindows(),
-                                         max_open_applications=1)
-        serve(sys.stdin, sys.stdout, LocalControlPlane(store, scheduler))
+        if not args.mcp_cli:
+            scheduler = ApplicationScheduler(store, _UnavailableWorker(), _UnavailableWindows(),
+                                             max_open_applications=args.max_open_applications)
+            serve(sys.stdin, sys.stdout, LocalControlPlane(store, scheduler))
+            return
+        cli = Path(args.mcp_cli).expanduser().resolve()
+        if not cli.is_file() or not shutil.which("node"):
+            raise ValueError("Playwright MCP CLI or Node is unavailable")
+        command = lambda: MCPServerCommand(shutil.which("node") or "node", (
+            str(cli), "--isolated", "--no-webmcp", "--browser", "chrome", "--codegen", "none"))
+        windows = MCPManagedWindows(command)
+        try:
+            worker = LaunchAndLoginWorker(store, ApplicationLauncher(windows),
+                                          LocalLoginConfiguration(args.config))
+            scheduler = ApplicationScheduler(store, worker, windows,
+                                             max_open_applications=args.max_open_applications)
+            control = LocalControlPlane(store, scheduler)
+            selector = selectors.DefaultSelector()
+            selector.register(sys.stdin, selectors.EVENT_READ)
+            completed_passes: set[tuple[str, str | None]] = set()
+            next_tick = time.monotonic() + 1
+            try:
+                while True:
+                    if time.monotonic() >= next_tick:
+                        progress_running_batch(store, scheduler, completed_passes)
+                        next_tick = time.monotonic() + 1
+                    events = selector.select(timeout=max(0, next_tick - time.monotonic()))
+                    if events:
+                        line = sys.stdin.readline()
+                        if not line:
+                            break
+                        sys.stdout.write(handle_line(line, control) + "\n")
+                        sys.stdout.flush()
+            finally:
+                selector.close()
+        finally:
+            windows.close()
 
 
 if __name__ == "__main__":

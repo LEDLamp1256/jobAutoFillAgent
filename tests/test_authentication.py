@@ -42,6 +42,9 @@ class FakeCredentials:
         self.password = password
         self.lookups = []
 
+    def destination_is_authorized(self, location, identity):
+        return location.startswith("https://example.test/")
+
     async def get_password(self, account_id):
         self.lookups.append(account_id)
         return self.password

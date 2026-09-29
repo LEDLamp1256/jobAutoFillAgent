@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 from .application_worker import ApplicationWorkerPort, WorkRequest, WorkerOutcome, WorkerYield
 from .batch_domain import (
-    ApplicationReport, ApplicationTask, HumanAuthorization, Ownership, Provenance,
+    ApplicationReport, ApplicationTask, Blocker, HumanAuthorization, Ownership, Provenance,
     ReportKind, ReviewState, TaskStatus, Verification,
 )
 from .persistence import BatchStore
@@ -90,7 +90,16 @@ class ApplicationScheduler:
                 continue
             window_id = self.windows.window_for_task(task.id)
             if window_id is not None and not self.windows.exists(window_id):
-                window_id = None
+                # Preserve an ambiguous live session for the owner. Closing it
+                # could discard an unexpected human/site tab, and index zero
+                # cannot identify a safe replacement page.
+                if task.status is TaskStatus.QUEUED:
+                    task = self.store.start(task.id, browser_session_id=window_id)
+                outcome = WorkerOutcome(WorkerYield.HUMAN_BLOCKED, blocker=Blocker.OTHER,
+                                        page_or_step="managed_window")
+                task = self.store.pause_for_human(task.id, Blocker.OTHER,
+                                                  page_or_step="managed_window")
+                return SchedulerStep(task, outcome)
             if window_id is None:
                 if self.windows.open_count() >= self.max_open_applications:
                     if active:
@@ -111,6 +120,7 @@ class ApplicationScheduler:
             outcome = self.worker.work_until_yield(request)
             if not isinstance(outcome, WorkerOutcome):
                 raise TypeError("worker must return WorkerOutcome")
+            task = self.store.get_task(task.id)
             for issue in outcome.issues:
                 self.store.add_report_entry(task.id, page_or_step=issue.page_or_step,
                                             visible_label=issue.visible_label, semantic_key=None,
