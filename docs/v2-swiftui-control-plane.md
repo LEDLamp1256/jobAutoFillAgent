@@ -1,9 +1,12 @@
 # V2-9B macOS control and review frontend
 
+For the later local `.app` build and canonical Finder install, see
+`docs/v2-macos-app.md`. The `swift run` instructions below remain a development
+route.
+
 `Package.swift` defines a macOS 14 SwiftUI executable, a small reusable core,
-and XCTest tests. It uses Foundation, Combine, and SwiftUI only. This is a
-development executable; producing a signed `.app` and bundling Python are
-future packaging work. The repository has no pre-existing Xcode project.
+and XCTest tests. It uses Foundation, Combine, and SwiftUI only. The local
+`.app` assembly is documented separately. The repository has no Xcode project.
 
 The native app owns one Python child process. `ControlPlaneProcess` starts
 `python -m jobagent.control_plane_stdio --db PATH` with the repository as its
@@ -37,8 +40,8 @@ the backend is disconnected or in error; it explicitly starts a new child and
 reloads SQLite state. Both toolbar controls have visible labels and tooltips.
 Report refresh does not send commands and does not save a narrative editor's
 local draft. Selecting a task only queries details. The separate Bring Window
-to Front button sends the foreground command; until a real window port exists,
-the backend's `WINDOW_UNAVAILABLE` error is shown in the UI.
+to Front button sends the foreground command; an unavailable managed window
+produces the backend's `WINDOW_UNAVAILABLE` error in the UI.
 
 Resume, report-item review, narrative approval/replacement, and final-review
 checkoff are sent only from explicit buttons. A narrative replacement is sent
@@ -53,6 +56,5 @@ pair must share task, page, question label, and semantic key, with the replaceme
 later in report order. Ambiguous entries stay separate rather than inventing a
 replacement relationship. Both original and replacement remain persisted.
 
-The initial build is a Swift package rather than an Xcode app bundle. The next
-UI packaging decision is how to ship the native executable and Python runtime
-together; it is not needed for this offline control/review slice.
+The original development build is a Swift package. The local `.app` installer
+assembles its executable and Python backend without changing this frontend.

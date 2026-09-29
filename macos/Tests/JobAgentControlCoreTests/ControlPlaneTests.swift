@@ -72,6 +72,94 @@ private actor FakeClient: ControlPlaneClient {
 }
 
 final class ControlPlaneTests: XCTestCase {
+    func testBundledRuntimeUsesStableSupportPathsOutsideApp() throws {
+        let home = URL(fileURLWithPath: "/Users/local-test", isDirectory: true)
+        let resources = URL(fileURLWithPath: "/tmp/Job Application Agent.app/Contents/Resources", isDirectory: true)
+        let configuration = try XCTUnwrap(BackendConfiguration.fromEnvironment(
+            [:], bundleResources: resources, homeDirectory: home, isBundledApplication: true))
+        let support = "/Users/local-test/Library/Application Support/Job Application Agent"
+        XCTAssertEqual(configuration.repositoryRoot.path, resources.appendingPathComponent("Backend").path)
+        XCTAssertEqual(configuration.pythonExecutable, support + "/runtime/python/bin/python")
+        XCTAssertEqual(configuration.nodeExecutable, support + "/runtime/bin/node")
+        XCTAssertEqual(configuration.mcpCLIPath,
+                       support + "/runtime/playwright-mcp/node_modules/@playwright/mcp/cli.js")
+        XCTAssertEqual(configuration.databasePath, support + "/applications.sqlite3")
+        XCTAssertEqual(configuration.configurationPath, support + "/config.json")
+        XCTAssertFalse(configuration.databasePath.hasPrefix(resources.path))
+        XCTAssertFalse(try XCTUnwrap(configuration.configurationPath).hasPrefix(resources.path))
+        XCTAssertNil(BackendConfiguration.fromEnvironment(
+            [:], bundleResources: resources, homeDirectory: home, isBundledApplication: false))
+    }
+
+    func testDevelopmentEnvironmentKeepsExistingBackendContract() throws {
+        let configuration = try XCTUnwrap(BackendConfiguration.fromEnvironment(
+            ["JOBAGENT_BACKEND_ROOT": "/tmp/source", "JOBAGENT_DB_PATH": "/tmp/dev.sqlite3",
+             "JOBAGENT_PYTHON": "/tmp/python"], bundleResources: nil,
+            isBundledApplication: false))
+        XCTAssertEqual(configuration.repositoryRoot.path, "/tmp/source")
+        XCTAssertEqual(configuration.databasePath, "/tmp/dev.sqlite3")
+        XCTAssertEqual(configuration.pythonExecutable, "/tmp/python")
+        XCTAssertNil(configuration.configurationPath)
+    }
+
+    func testMissingPythonAndUnavailableSupportGiveActionableErrors() async throws {
+        let missing = ControlPlaneProcess(configuration: BackendConfiguration(
+            pythonExecutable: "/nonexistent/jobagent-python", repositoryRoot: URL(fileURLWithPath: "/tmp"),
+            databasePath: "/tmp/unused.sqlite3"))
+        do {
+            try await missing.restart()
+            XCTFail("Missing Python must fail before launching a child")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("Python runtime is missing"))
+        }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let backend = directory.appendingPathComponent("jobagent")
+        try FileManager.default.createDirectory(at: backend, withIntermediateDirectories: true)
+        try Data().write(to: backend.appendingPathComponent("control_plane_stdio.py"))
+        let blocked = directory.appendingPathComponent("support-file")
+        try Data().write(to: blocked)
+        let client = ControlPlaneProcess(configuration: BackendConfiguration(
+            pythonExecutable: "/usr/bin/python3", repositoryRoot: directory,
+            databasePath: blocked.appendingPathComponent("applications.sqlite3").path,
+            supportDirectory: blocked))
+        do {
+            try await client.restart()
+            XCTFail("An unusable support directory must fail visibly")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("Application Support"))
+        }
+    }
+
+    func testMissingMCPAndDatabaseOpenFailureAreVisible() async throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let python = ProcessInfo.processInfo.environment["JOBAGENT_TEST_PYTHON"] ?? "/usr/bin/python3"
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let missingMCP = ControlPlaneProcess(configuration: BackendConfiguration(
+            pythonExecutable: python, repositoryRoot: root,
+            databasePath: directory.appendingPathComponent("unused.sqlite3").path,
+            mcpCLIPath: directory.appendingPathComponent("missing-cli.js").path))
+        do {
+            try await missingMCP.restart()
+            XCTFail("Missing MCP must fail before launching Python")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("Playwright MCP runtime is missing"))
+        }
+        let invalidDatabase = ControlPlaneProcess(configuration: BackendConfiguration(
+            pythonExecutable: python, repositoryRoot: root, databasePath: directory.path))
+        do {
+            try await invalidDatabase.restart()
+            XCTFail("SQLite cannot open a directory as a database")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("database"))
+        }
+        await invalidDatabase.shutdown()
+    }
+
     func testNarrativeReplacementIsCurrentAndOriginalRemainsHistory() {
         let draft = narrative(id: "draft", provenance: "ai_draft_review", action: "drafted",
                               reviewState: "approved", createdAt: "2026-09-28T00:00:00Z", text: "AI text")
@@ -208,16 +296,19 @@ final class ControlPlaneTests: XCTestCase {
         await client.shutdown()
     }
 
-    func testUnexpectedChildExitBecomesDisconnected() async throws {
+    func testUnexpectedChildExitProducesStartupError() async throws {
         let configuration = BackendConfiguration(
             pythonExecutable: "/usr/bin/false",
-            repositoryRoot: FileManager.default.temporaryDirectory,
+            repositoryRoot: URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+                .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent(),
             databasePath: "/private/tmp/unused-jobagent-test.sqlite3")
         let client = ControlPlaneProcess(configuration: configuration)
-        try await client.restart()
-        try await Task.sleep(nanoseconds: 100_000_000)
-        let state = await client.connectionState()
-        XCTAssertEqual(state, .disconnected)
+        do {
+            try await client.restart()
+            XCTFail("A child that exits immediately must fail the startup handshake")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("database"))
+        }
         await client.shutdown()
     }
 }
