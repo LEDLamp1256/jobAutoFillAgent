@@ -121,6 +121,14 @@ public final class AppStore: ObservableObject {
         } catch { await record(error) }
     }
 
+    public func recordSubmission(_ taskId: String) async {
+        guard let client else { return }
+        do {
+            let _: ApplicationDTO = try await client.send(.recordSubmission(taskId), as: ApplicationDTO.self)
+            await refresh()
+        } catch { await record(error) }
+    }
+
     private func loadDetail(_ taskId: String, client: any ControlPlaneClient) async throws {
         let detail: ApplicationDTO = try await client.send(.getApplication(taskId), as: ApplicationDTO.self)
         let fullReport: ReportDTO = try await client.send(.getApplicationReport(taskId), as: ReportDTO.self)

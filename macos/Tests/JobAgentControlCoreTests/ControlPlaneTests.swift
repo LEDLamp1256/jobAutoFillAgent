@@ -3,7 +3,9 @@ import XCTest
 @testable import JobAgentControlCore
 
 private func applicationJSON(status: String = "human_paused", resume: Bool = true,
-                             ready: Bool = false) -> Data {
+                             ready: Bool = false, phase: String? = nil,
+                             pending: Int = 0, checked: Bool = false,
+                             recordSubmission: Bool = false) -> Data {
     let object: [String: Any] = [
         "task_id": "task-a", "run_id": "run-a", "listing_id": "listing-a",
         "company": "Acme", "title": "Engineer", "status": status,
@@ -12,8 +14,11 @@ private func applicationJSON(status: String = "human_paused", resume: Bool = tru
         "blocker": resume ? "needs_answer" : NSNull(), "failure_reason": NSNull(),
         "window_associated": true, "window_available": false,
         "resume_available": resume, "ready_for_review": ready,
-        "final_review_available": ready, "final_review_checked": false,
-        "pending_review_count": 0, "pending_narrative_count": 0,
+        "review_phase": phase.map { $0 as Any } ?? NSNull(),
+        "final_review_available": ready && pending == 0 && !checked,
+        "final_review_checked": checked,
+        "record_submission_available": recordSubmission,
+        "pending_review_count": pending, "pending_narrative_count": 0,
         "created_at": "2026-09-28T00:00:00+00:00", "updated_at": "2026-09-28T00:00:00+00:00",
     ]
     return try! JSONSerialization.data(withJSONObject: object)
@@ -45,6 +50,9 @@ private actor FakeClient: ControlPlaneClient {
     private(set) var restartCount = 0
     var failure: ControlClientError?
     private var connected = false
+    private var applicationData = applicationJSON()
+
+    func setApplicationData(_ data: Data) { applicationData = data }
 
     func restart() { connected = true; restartCount += 1 }
     func connectionState() -> BackendConnection { connected ? .connected : .disconnected }
@@ -55,9 +63,13 @@ private actor FakeClient: ControlPlaneClient {
         let data: Data
         switch operation {
         case .listRuns: data = Data("[\(String(decoding: runJSON, as: UTF8.self))]".utf8)
-        case .listApplications, .listAttentionRequired:
-            data = Data("[\(String(decoding: applicationJSON(), as: UTF8.self))]".utf8)
-        case .getApplication: data = applicationJSON()
+        case .listApplications:
+            data = Data("[\(String(decoding: applicationData, as: UTF8.self))]".utf8)
+        case .listAttentionRequired:
+            data = String(decoding: applicationData, as: UTF8.self).contains("\"status\":\"submitted_by_human\"")
+                ? Data("[]".utf8)
+                : Data("[\(String(decoding: applicationData, as: UTF8.self))]".utf8)
+        case .getApplication: data = applicationData
         case .getApplicationReport, .getNarrativeEntries:
             data = Data("{\"task_id\":\"task-a\",\"entries\":[]}".utf8)
         case .resumeApplication: data = applicationJSON(status: "queued", resume: false)
@@ -65,6 +77,10 @@ private actor FakeClient: ControlPlaneClient {
             data = Data("{\"task_id\":\"task-a\",\"foregrounded\":true}".utf8)
         case .reviewReportEntry, .replaceNarrative: data = reportEntryJSON
         case .markFinalReviewChecked: data = applicationJSON(status: "ready_for_review", resume: false, ready: true)
+        case .recordSubmission:
+            applicationData = applicationJSON(status: "submitted_by_human", resume: false,
+                                              phase: "submitted", checked: true)
+            data = applicationData
         case .getRun: data = runJSON
         }
         return try JSONDecoder.controlPlane.decode(T.self, from: data)
@@ -197,6 +213,25 @@ final class ControlPlaneTests: XCTestCase {
         XCTAssertNil(report.pageOrStep)
     }
 
+    func testBackendReviewPhasesDriveVisibleLabelsAndSubmissionAvailability() throws {
+        let cases: [(String, Bool, String?, Int, Bool, Bool, String)] = [
+            ("ready_for_review", true, "needs_review", 1, false, false, "Needs Review"),
+            ("ready_for_review", true, "ready_for_final_review", 0, false, false, "Ready for Final Review"),
+            ("ready_for_review", true, "ready_to_submit", 0, true, true, "Ready to Submit"),
+            ("submitted_by_human", false, "submitted", 0, true, false, "Submitted"),
+            ("human_paused", false, nil, 0, false, false, "HUMAN PAUSED"),
+        ]
+        for (status, ready, phase, pending, checked, available, label) in cases {
+            let application = try JSONDecoder.controlPlane.decode(
+                ApplicationDTO.self, from: applicationJSON(status: status, resume: false,
+                    ready: ready, phase: phase, pending: pending, checked: checked,
+                    recordSubmission: available))
+            XCTAssertEqual(application.reviewPhase, phase)
+            XCTAssertEqual(application.statusLabel, label)
+            XCTAssertEqual(application.recordSubmissionAvailable, available)
+        }
+    }
+
     func testRequestEncodingHasFixedMethodsAndNoAuthorizationFields() throws {
         let resume = try XCTUnwrap(String(data: ControlOperation.resumeApplication("task-a").encodedLine(id: "1"), encoding: .utf8))
         XCTAssertTrue(resume.hasSuffix("\n"))
@@ -209,6 +244,12 @@ final class ControlPlaneTests: XCTestCase {
             with: ControlOperation.bringWindowToFront("task-a").encodedLine(id: "2")) as? [String: Any])
         XCTAssertEqual(foreground["method"] as? String, "bring_window_to_front")
         XCTAssertNotEqual(foreground["method"] as? String, object["method"] as? String)
+        let record = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: ControlOperation.recordSubmission("task-a").encodedLine(id: "3")) as? [String: Any])
+        XCTAssertEqual(record["method"] as? String, "record_submission")
+        XCTAssertEqual(record["params"] as? [String: String], ["task_id": "task-a"])
+        XCTAssertNil(record["actor"])
+        XCTAssertNil(record["action"])
     }
 
     @MainActor
@@ -270,6 +311,32 @@ final class ControlPlaneTests: XCTestCase {
         XCTAssertFalse(operations.contains(.resumeApplication("task-a")))
         XCTAssertFalse(operations.contains(.bringWindowToFront("task-a")))
         XCTAssertFalse(operations.contains(.markFinalReviewChecked("task-a")))
+        XCTAssertFalse(operations.contains(.recordSubmission("task-a")))
+    }
+
+    @MainActor
+    func testRecordSubmissionIsExplicitAndRefreshesSubmittedState() async {
+        let fake = FakeClient()
+        await fake.setApplicationData(applicationJSON(status: "ready_for_review", resume: false,
+            ready: true, phase: "ready_to_submit", checked: true, recordSubmission: true))
+        let store = AppStore(client: fake)
+        await store.reconnect()
+        await store.selectApplication("task-a")
+        XCTAssertEqual(store.selectedApplication?.statusLabel, "Ready to Submit")
+        XCTAssertEqual(store.selectedApplication?.recordSubmissionAvailable, true)
+        var operations = await fake.operations
+        XCTAssertFalse(operations.contains(.recordSubmission("task-a")))
+        await store.refresh()
+        operations = await fake.operations
+        XCTAssertFalse(operations.contains(.recordSubmission("task-a")))
+        await store.recordSubmission("task-a")
+        operations = await fake.operations
+        XCTAssertEqual(operations.filter { $0 == .recordSubmission("task-a") }.count, 1)
+        XCTAssertEqual(store.selectedApplication?.statusLabel, "Submitted")
+        XCTAssertEqual(store.selectedApplication?.status, "submitted_by_human")
+        XCTAssertEqual(store.selectedApplication?.recordSubmissionAvailable, false)
+        XCTAssertEqual(store.attention.count, 0)
+        XCTAssertEqual(store.applications.count, 1)
     }
 
     func testRealPythonChildSmokeAndControlledDisconnect() async throws {

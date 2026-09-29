@@ -43,12 +43,18 @@ local draft. Selecting a task only queries details. The separate Bring Window
 to Front button sends the foreground command; an unavailable managed window
 produces the backend's `WINDOW_UNAVAILABLE` error in the UI.
 
-Resume, report-item review, narrative approval/replacement, and final-review
-checkoff are sent only from explicit buttons. A narrative replacement is sent
+Resume, report-item review, narrative approval/replacement, final-review
+checkoff, and Record as Submitted are sent only from explicit buttons. A narrative replacement is sent
 only on Save Replacement; typing stays local. The backend decides whether each
 transition is legal and returns structured errors. Swift cannot encode actor
-or authorization action fields in its fixed request enum. The UI has no Submit
-control, and final-review checkoff is labeled as distinct from submission.
+or authorization action fields in its fixed request enum. The UI has no browser
+Submit control. Python derives Needs Review, Ready for Final Review, Ready to
+Submit, and Submitted from durable status, pending report count, and final
+review checkoff. Record as Submitted appears only when Python says it is
+available; a confirmation dialog reminds the owner to submit manually on the
+employer website first. The confirmed action records the owner's submission
+through the existing guarded SQLite transition and does not use the browser.
+The managed window is not automatically closed or released.
 
 Narrative Review shows a unique approved human replacement as the current answer
 and keeps its matching approved AI draft in a collapsible history section. The
