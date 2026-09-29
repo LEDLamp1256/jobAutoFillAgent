@@ -1,12 +1,17 @@
-# V2-10 managed application runtime
+# V2-11 managed application runtime
 
 The local stdio backend uses the existing `ApplicationScheduler` and
 `ApplicationWindowPort`. Set `JOB_AGENT_PLAYWRIGHT_MCP_CLI` to an installed
 Playwright MCP CLI before starting the SwiftUI app or Python backend. The CLI
 can also be supplied with `--mcp-cli`. Without it, the backend remains in its
 safe unavailable-window mode. Each task gets one isolated headed MCP browser
-session. The backend processes one bounded launch/login pass at a time and
-stops at the application page. It does not traverse or fill application pages.
+session. The backend processes one bounded launch/login and current-page pass
+at a time. At an application page, the existing controller resolves safe text
+and choice fields deterministically, performs one mutation, obtains a fresh
+observation, and verifies the result before continuing. It never activates
+Next/Continue or final Submit. A one-page terminal form with no unresolved
+work reaches `READY_FOR_REVIEW`; an unresolved or multi-page boundary yields
+`HUMAN_PAUSED` with the managed browser available.
 Only a persisted `RUNNING` run authorizes an idle automation tick. A newly
 created run stays `CREATED`; starting or reconnecting the backend and serving
 NDJSON requests do not start it. V2-10 adds no UI command to start a run.
@@ -21,6 +26,19 @@ protocol. Each credential action checks the current observed HTTPS hostname.
 The second check happens after username entry and before reading the password.
 Account IDs are exact hostnames, so cross-host account continuity is not
 supported. Raw MCP server stderr goes to a nonpersistent null sink.
+
+Each verified current-page field receives a nonsecret report entry with its
+label, semantic key, source, action, and verification state. Pending fields
+receive a reason and are reused on an unchanged Resume pass. The final fresh
+observation supplies live refs for presentation-only green verified and red
+needs-review markers. A manual correction is reassessed on Resume and loses
+its red marker when complete; it is not recorded as an automated green fill.
+Colors follow the existing answer safety policy, not an arbitrary confidence
+threshold. Existing profile/Q&A resolution is the production baseline;
+narrative writing, sensitive fields, toggles, and file upload remain for human
+review. The pinned MCP upload tool is chooser based and this stage has no
+targeted, freshly verifiable upload action. No additional model service is
+required for the app.
 
 The backend stores only the opaque window association already supported by
 SQLite. A restarted backend owns no prior live browser objects, so it validates

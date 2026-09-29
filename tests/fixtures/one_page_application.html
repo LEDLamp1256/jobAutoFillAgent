@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Local one-page application fixture</title></head>
+<body>
+  <main>
+    <h1>Fixture application</h1>
+    <form id="application">
+      <h2>Application details</h2>
+      <p><label for="first-name">First name</label><input id="first-name" name="first_name" required style="border: 1px dotted navy"></p>
+      <p><label for="last-name">Last name</label><input id="last-name" name="last_name" required></p>
+      <p><label for="email">Email</label><input id="email" name="email" type="email" required></p>
+      <fieldset>
+        <legend>Are you authorized to work in the US?</legend>
+        <label><input type="radio" name="authorization" value="Yes" required>Yes</label>
+        <label><input type="radio" name="authorization" value="No">No</label>
+      </fieldset>
+      <p><label for="unknown">Fixture clearance code</label><input id="unknown" name="unknown" required></p>
+      <button id="final-submit" type="submit">Submit application</button>
+    </form>
+    <output id="submit-count" aria-label="Submit interaction count">0</output>
+  </main>
+  <script>
+    (() => {
+      let count = 0;
+      const form = document.getElementById('application');
+      const submit = document.getElementById('final-submit');
+      const output = document.getElementById('submit-count');
+      submit.addEventListener('click', () => { output.value = String(++count); });
+      form.addEventListener('submit', event => event.preventDefault());
+    })();
+  </script>
+</body>
+</html>

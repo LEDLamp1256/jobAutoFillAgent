@@ -217,6 +217,9 @@ _TEXTBOX = re.compile(r'^\s*- textbox ("(?:\\.|[^"\\])*")(.*?)\[ref=([^\]\s]{1,1
 _GROUP = re.compile(r'^(\s*)- group ("(?:\\.|[^"\\])*") \[ref=(e\d+)\]')
 _RADIO = re.compile(r'^\s*- radio ("(?:\\.|[^"\\])*")(.*?)\[ref=([^\]\s]{1,128})\]$')
 _BUTTON = re.compile(r'^\s*- button ("(?:\\.|[^"\\])*")(.*?)\[ref=([^\]\s]{1,128})\]$')
+_COMBO = re.compile(r'^(\s*)- combobox ("(?:\\.|[^"\\])*")(.*?)\[ref=([^\]\s]{1,128})\](?:: (.*))?$')
+_OPTION = re.compile(r'^\s*- option ("(?:\\.|[^"\\])*")(.*?)(?:\[ref=([^\]\s]{1,128})\])?(?::.*)?$')
+_CHECKBOX = re.compile(r'^\s*- checkbox ("(?:\\.|[^"\\])*")(.*?)\[ref=([^\]\s]{1,128})\]$')
 _ALERT = re.compile(r'^\s*- alert \[ref=e\d+\]: (.+)$')
 
 
@@ -280,6 +283,12 @@ class SnapshotNormalizer:
         group_options: list[str] = []
         checked: str | None = None
         group_required = False
+        combo_label: str | None = None
+        combo_ref: str | None = None
+        combo_indent = -1
+        combo_options: list[str] = []
+        combo_value: str | None = None
+        combo_required = False
 
         def finish_group() -> None:
             nonlocal group_label, group_ref, group_options, checked, group_required
@@ -295,10 +304,25 @@ class SnapshotNormalizer:
             group_options = []
             group_required = False
 
+        def finish_combo() -> None:
+            nonlocal combo_label, combo_ref, combo_options, combo_value, combo_required
+            if combo_label is not None and combo_ref is not None:
+                questions.append(QuestionObservation(
+                    label=combo_label, control_type=ControlType.CHOICE,
+                    semantic_key=self._aliases.get(combo_label.casefold()),
+                    section=headings.get(2), options=tuple(combo_options),
+                    current_value=combo_value,
+                    required=True if combo_required else None, target_ref=combo_ref))
+            combo_label = combo_ref = combo_value = None
+            combo_options = []
+            combo_required = False
+
         for line in yaml_match.group(1).splitlines():
             indent = len(line) - len(line.lstrip())
             if group_label is not None and indent <= group_indent and line.lstrip().startswith("- "):
                 finish_group()
+            if combo_label is not None and indent <= combo_indent and line.lstrip().startswith("- "):
+                finish_combo()
             if match := _HEADING.match(line):
                 headings[int(match.group(2))] = _scalar(match.group(1))
             elif match := _PARAGRAPH.match(line):
@@ -317,6 +341,26 @@ class SnapshotNormalizer:
                     option_targets[(group_ref, option)] = match.group(3)
                     if "[checked]" in match.group(2):
                         checked = option
+            elif match := _COMBO.match(line):
+                finish_combo()
+                combo_indent = len(match.group(1))
+                combo_label, combo_ref = _scalar(match.group(2)), match.group(4)
+                combo_required = "[required]" in match.group(3)
+                combo_value = _scalar(match.group(5)) if match.group(5) else None
+            elif match := _OPTION.match(line):
+                if combo_ref is not None:
+                    option = _scalar(match.group(1))
+                    combo_options.append(option)
+                    if "[selected]" in match.group(2) and option.casefold() not in {"select", "choose", "select one"}:
+                        combo_value = option
+            elif match := _CHECKBOX.match(line):
+                label = _scalar(match.group(1))
+                questions.append(QuestionObservation(
+                    label=label, control_type=ControlType.TOGGLE,
+                    semantic_key=self._aliases.get(label.casefold()), section=headings.get(2),
+                    required=True if "[required]" in match.group(2) else None,
+                    current_value="checked" if "[checked]" in match.group(2) else None,
+                    target_ref=match.group(3)))
             elif match := _TEXTBOX.match(line):
                 label = _scalar(match.group(1))
                 secret = bool(re.search(r"\b(password|passphrase)\b", label, re.IGNORECASE))
@@ -334,6 +378,7 @@ class SnapshotNormalizer:
             elif match := _ALERT.match(line):
                 validation.append(_scalar(match.group(1)))
         finish_group()
+        finish_combo()
 
         heading = headings.get(2) or headings.get(1)
         if not heading:

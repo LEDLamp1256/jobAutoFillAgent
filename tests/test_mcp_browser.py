@@ -18,14 +18,16 @@ from tests.test_snapshot import STEP_1, REVIEW
 
 
 def tool(name, properties):
-    types = {"submit": "boolean"}
+    types = {"submit": "boolean", "values": "array"}
     return SimpleNamespace(name=name, input_schema={"properties": {
         key: {"type": types.get(key, "string")} for key in properties}})
 
 
 TOOLS = [tool("browser_navigate", {"url"}), tool("browser_snapshot", set()),
          tool("browser_type", {"target", "text", "submit"}),
-         tool("browser_click", {"target"}), tool("browser_close", set())]
+         tool("browser_click", {"target"}), tool("browser_close", set()),
+         tool("browser_evaluate", {"element", "target", "function"}),
+         tool("browser_select_option", {"target", "values"})]
 
 LOGIN = '''### Page
 - Page URL: https://example.test/login
@@ -69,6 +71,44 @@ class FakeClient:
 
 
 class AdapterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_annotation_ref_shared_by_two_fields_is_rejected(self):
+        duplicate = STEP_1.replace('textbox "Last name" [ref=e9]',
+                                   'textbox "Last name" [ref=e8]')
+        fake = FakeClient(None, snapshots=[duplicate])
+        async with PlaywrightMCPAdapter(MCPServerCommand("node", ("cli.js",)),
+                                        client_factory=lambda _: fake) as adapter:
+            observation = await adapter.observe()
+            with self.assertRaises(PermissionError):
+                await adapter.annotate_field("e8", observation.observation_id, "needs-review")
+        self.assertFalse(any(name == "browser_evaluate" for name, _ in fake.calls))
+
+    async def test_annotation_uses_only_current_unique_field_ref_and_no_form_action(self):
+        class AnnotationClient(FakeClient):
+            async def call_tool(self, name, args):
+                if name == "browser_evaluate":
+                    self.calls.append((name, args))
+                    return SimpleNamespace(is_error=False, content=[
+                        SimpleNamespace(type="text", text="### Result\ntrue")])
+                return await super().call_tool(name, args)
+        fake = AnnotationClient(None, snapshots=[STEP_1, STEP_1])
+        async with PlaywrightMCPAdapter(MCPServerCommand("node", ("cli.js",)),
+                                        client_factory=lambda _: fake) as adapter:
+            first = await adapter.observe()
+            await adapter.annotate_field("e8", first.observation_id, "verified")
+            await adapter.annotate_field("e8", first.observation_id, "verified")
+            await adapter.annotate_field("e8", first.observation_id, "needs-review")
+            with self.assertRaises(PermissionError):
+                await adapter.annotate_field("e11", first.observation_id, "verified")
+            second = await adapter.observe()
+            with self.assertRaises(PermissionError):
+                await adapter.annotate_field("e8", first.observation_id, "verified")
+            await adapter.annotate_field("e8", second.observation_id, "clear")
+        calls = [args for name, args in fake.calls if name == "browser_evaluate"]
+        self.assertEqual(len(calls), 4)
+        self.assertEqual({args["target"] for args in calls}, {"e8"})
+        self.assertEqual({name for name, _ in fake.calls} - {
+            "browser_snapshot", "browser_evaluate", "browser_close"}, set())
+
     async def test_page_marker_uses_bounded_evaluation_result(self):
         class MarkerClient(FakeClient):
             async def call_tool(self, name, args):
@@ -77,7 +117,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                     return SimpleNamespace(is_error=False, content=[
                         SimpleNamespace(type="text", text="### Result\ntrue")])
                 return SimpleNamespace(is_error=False, content=[])
-        fake = MarkerClient(None, tools=TOOLS + [tool("browser_evaluate", {"function"})])
+        fake = MarkerClient(None)
         async with PlaywrightMCPAdapter(MCPServerCommand("node", ("cli.js",)),
                                         client_factory=lambda _: fake) as adapter:
             await adapter.set_managed_page_token("synthetic-page-token")

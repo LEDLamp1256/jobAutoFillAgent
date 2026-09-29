@@ -7,12 +7,12 @@ from enum import Enum
 
 from jobagent.browser import BrowserPort, BrowserActionResult
 from jobagent.domain import (
-    ActionPolicy, ActionStatus, Advance, ApplicationObservation, ApplicationOutcome,
+    ActionPolicy, ActionStatus, Advance, AnswerSource, ApplicationObservation, ApplicationOutcome,
     ApplicationSession, ChooseOption, ControlType, FillText, NavigationKind,
     QuestionObservation, ResolutionTrace, SessionActionRecord, StepTransition, semantic_fingerprint,
 )
 from jobagent.resolution import (
-    AsyncAnswerResolver, DeterministicAnswerResolver, DeterministicAsyncResolver,
+    AsyncAnswerResolver, CanonicalStatus, DeterministicAnswerResolver, DeterministicAsyncResolver,
     ResolutionStatus,
 )
 
@@ -96,6 +96,26 @@ class ControllerResult:
     stop: ControllerStop
     session: ApplicationSession
     reason: str = ""
+    fields: tuple[CurrentPageField, ...] = ()
+
+
+@dataclass(frozen=True)
+class CurrentPageField:
+    """Final live question and its nonsecret current-page decision."""
+
+    question: QuestionObservation
+    semantic_key: str | None
+    action: str
+    source: AnswerSource | None = None
+    reason: str | None = None
+
+    @property
+    def verified(self) -> bool:
+        return self.action in {"filled_text", "selected_option", "confirmed_trusted"}
+
+    @property
+    def needs_review(self) -> bool:
+        return self.reason is not None
 
 
 _ADVANCE_LABELS = {"next", "continue", "save and continue", "save & continue"}
@@ -113,9 +133,12 @@ class ApplicationController:
         self.limits = limits or ControllerLimits()
 
     async def run(self, session: ApplicationSession, *, allow_advance: bool = True,
-                  initial_observation: ApplicationObservation | None = None) -> ControllerResult:
+                  initial_observation: ApplicationObservation | None = None,
+                  current_page_only: bool = False) -> ControllerResult:
         if session.current_observation is not None:
             raise ValueError("V2-4 controller starts with a new in-memory session")
+        if current_page_only:
+            return await self._run_current_page(session, initial_observation)
         actions = same_step_actions = transitions = 0
         advance_needs_repair = False
         try:
@@ -252,3 +275,148 @@ class ApplicationController:
         session.action_history.append(SessionActionRecord(
             kind, semantic_key, before.observation_id, result.observation.observation_id,
             status or result.outcome.status))
+
+    async def _run_current_page(self, session: ApplicationSession,
+                                initial: ApplicationObservation | None) -> ControllerResult:
+        """Fill this observed page only; terminal controls never short-circuit fields."""
+        completed: dict[tuple[str, ...], tuple[str, AnswerSource, str]] = {}
+        declined: dict[tuple[str, ...], str] = {}
+        limit_reached = False
+        try:
+            session.record_observation(initial if initial is not None else await self.browser.observe())
+            for cycle in range(self.limits.max_cycles):
+                observation = session.current_observation
+                assert observation is not None
+                if cycle >= min(self.limits.max_actions, self.limits.max_same_step_actions) and cycle:
+                    limit_reached = True
+                    break
+                changed = False
+                for question in observation.questions:
+                    identity = question.identity()
+                    if identity in declined:
+                        continue
+                    resolution = await self.resolver.resolve(question, session.application_id)
+                    session.resolution_history.append(ResolutionTrace(
+                        observation.observation_id, resolution.canonical.semantic_key,
+                        resolution.mapping_source,
+                        resolution.answer.source if resolution.answer else None,
+                        resolution.status.value))
+                    if resolution.status is not ResolutionStatus.SAFE_TO_FILL or resolution.answer is None:
+                        continue
+                    answer = resolution.answer
+                    if answer.semantic_key in {"why_this_company", "why_this_role"} or answer.semantic_key.startswith("eeo_"):
+                        continue
+                    if _norm(question.current_value):
+                        continue
+                    if question.control_type not in {ControlType.TEXT, ControlType.CHOICE}:
+                        continue
+                    if (not question.target_ref or
+                            sum(q.target_ref == question.target_ref for q in observation.questions) != 1 or
+                            sum(q.identity() == identity for q in observation.questions) != 1):
+                        declined[identity] = "missing_or_ambiguous_target"
+                        continue
+                    action = (FillText(question.target_ref, observation.observation_id, answer)
+                              if question.control_type is ControlType.TEXT else
+                              ChooseOption(question.target_ref, observation.observation_id, answer))
+                    ActionPolicy.authorize(action, session)
+                    result = (await self.browser.fill_text(action, session)
+                              if isinstance(action, FillText) else
+                              await self.browser.choose_option(action, session))
+                    self._record_action(session, question.control_type.value, answer.semantic_key,
+                                        observation, result)
+                    session.record_observation(result.observation)
+                    if step_signature(observation) != step_signature(result.observation):
+                        declined[identity] = "unable_to_freshly_verify"
+                        break
+                    matches = [q for q in result.observation.questions if q.identity() == identity]
+                    if (result.outcome.status in {ActionStatus.FAILED, ActionStatus.TARGET_MISSING,
+                                                  ActionStatus.AMBIGUOUS_TARGET} or
+                            len(matches) != 1 or _norm(matches[0].current_value) != _norm(answer.value)):
+                        declined[identity] = "unable_to_freshly_verify"
+                    else:
+                        session.record_answer(question, answer)
+                        self.resolver.record_answer(answer)
+                        completed[identity] = ("filled_text" if isinstance(action, FillText)
+                                               else "selected_option", answer.source, answer.semantic_key)
+                    changed = True
+                    break
+                if not changed:
+                    break
+            else:
+                limit_reached = True
+
+            observation = session.current_observation
+            assert observation is not None
+            fields: list[CurrentPageField] = []
+            for question in observation.questions:
+                identity = question.identity()
+                resolution = await self.resolver.resolve(question, session.application_id)
+                key = resolution.canonical.semantic_key
+                answer = resolution.answer if resolution.status is ResolutionStatus.SAFE_TO_FILL else None
+                reason = declined.get(identity)
+                action = "deferred"
+                source = None
+                if (reason is None and answer is not None and _norm(question.current_value) and
+                        question.control_type in {ControlType.TEXT, ControlType.CHOICE} and
+                        answer.semantic_key not in {"why_this_company", "why_this_role"} and
+                        not answer.semantic_key.startswith("eeo_")):
+                    if _norm(question.current_value) == _norm(answer.value):
+                        session.record_answer(question, answer)
+                        previous = completed.get(identity)
+                        action = previous[0] if previous else "confirmed_trusted"
+                        source = answer.source
+                    else:
+                        reason = "conflicting_existing_value"
+                elif reason is None and _norm(question.current_value):
+                    # A human-entered value is complete for this page, but has no
+                    # trusted automated provenance and receives no GREEN marker.
+                    action = "manual_complete"
+                elif reason is None:
+                    if limit_reached and answer is not None:
+                        reason = "action_limit_reached"
+                    elif key in {"why_this_company", "why_this_role"}:
+                        reason = "narrative_deferred"
+                    elif key and key.startswith("eeo_"):
+                        reason = "requires_human_review"
+                    elif question.control_type in {ControlType.FILE, ControlType.TOGGLE,
+                                                   ControlType.SECRET, ControlType.UNKNOWN}:
+                        reason = "unsupported_control"
+                    elif answer is not None and not question.target_ref:
+                        reason = "missing_or_ambiguous_target"
+                    elif resolution.status is ResolutionStatus.REQUIRES_REVIEW:
+                        reason = "requires_human_review"
+                    elif resolution.reason == "value does not unambiguously match options":
+                        reason = "ambiguous_option_mapping"
+                    elif resolution.canonical.status is CanonicalStatus.AMBIGUOUS:
+                        reason = "ambiguous_semantic_mapping"
+                    elif question.required is False:
+                        action = "optional_skipped"
+                    else:
+                        reason = "no_safe_answer"
+                if reason is not None:
+                    session.mark_unresolved(question)
+                fields.append(CurrentPageField(question, key, action, source, reason))
+
+            items = tuple(fields)
+            if limit_reached:
+                return ControllerResult(ControllerStop.ACTION_LIMIT_REACHED, session,
+                                        "current-page action limit", items)
+            if any(field.needs_review for field in items):
+                return ControllerResult(ControllerStop.NEEDS_REVIEW, session,
+                                        "current page requires human review", items)
+            controls = observation.navigation_controls
+            submit = [control for control in controls if control.kind is NavigationKind.SUBMIT]
+            others = [control for control in controls if control.kind in
+                      {NavigationKind.ADVANCE, NavigationKind.UNKNOWN}]
+            if len(submit) == 1 and submit[0].target_ref and not others:
+                return ControllerResult(ControllerStop.READY_FOR_REVIEW, session,
+                                        "terminal page awaits human submission", items)
+            if (not submit and len(others) == 1 and
+                    others[0].kind is NavigationKind.ADVANCE and others[0].target_ref):
+                return ControllerResult(ControllerStop.STOPPED_BEFORE_ADVANCE, session,
+                                        "page complete; automatic advancement is outside V2-11", items)
+            return ControllerResult(ControllerStop.STOPPED_BEFORE_ADVANCE, session,
+                                    "terminal or navigation state is ambiguous", items)
+        except Exception:
+            session.fail()
+            return ControllerResult(ControllerStop.FAILED, session, "current-page browser or policy failure")
