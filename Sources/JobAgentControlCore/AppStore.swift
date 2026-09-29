@@ -21,7 +21,7 @@ public final class AppStore: ObservableObject {
     public init(client: (any ControlPlaneClient)?) {
         self.client = client
         if client == nil {
-            errorMessage = "Backend launch is not configured. Set JOBAGENT_BACKEND_ROOT and JOBAGENT_DB_PATH."
+            errorMessage = "Backend launch is not configured. Install Job Application Agent.app or set JOBAGENT_BACKEND_ROOT and JOBAGENT_DB_PATH for development."
         }
     }
 
