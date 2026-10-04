@@ -1,19 +1,22 @@
 import unittest
+import json
 import os
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from jobagent.domain import (
-    Advance, Answer, AnswerScope, AnswerSource, ApplicationSession,
-    FillText, Submit,
+    Advance, Answer, AnswerScope, AnswerSource, ApplicationObservation, ApplicationSession,
+    ControlType, QuestionObservation,
+    FillText, RevealOptions, Submit, Toggle, UploadDocument,
 )
 from jobagent.mcp_browser import (
     MCPServerCommand, MCPToolContractError, PlaywrightMCPAdapter, validate_tool_contract,
 )
-from jobagent.snapshot import SnapshotNormalizer
+from jobagent.snapshot import NormalizedSnapshot, SnapshotAccessChallenge, SnapshotEmpty, SnapshotNormalizer
 from tests.test_snapshot import STEP_1, REVIEW
 
 
@@ -38,6 +41,14 @@ LOGIN = '''### Page
   - textbox "Email Address" [ref=e4]
   - textbox "Password" [ref=e5]
   - button "Sign In" [ref=e6]
+```
+'''
+
+EMPTY = '''### Page
+- Page URL: https://example.test/apply
+### Snapshot
+```yaml
+
 ```
 '''
 
@@ -71,6 +82,361 @@ class FakeClient:
 
 
 class AdapterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unknown_on_value_is_rechecked_as_unchecked_checkbox(self):
+        class CheckboxClient(FakeClient):
+            async def call_tool(self, name, args):
+                if name == "browser_evaluate":
+                    self.calls.append((name, args))
+                    return SimpleNamespace(is_error=False, content=[SimpleNamespace(
+                        type="text", text='### Result\n{"kind":"toggle_state","value":"unchecked",'
+                                          '"rawRole":"input","required":false}')])
+                return await super().call_tool(name, args)
+
+        fake = CheckboxClient(None)
+        question = QuestionObservation("I have a preferred name", ControlType.UNKNOWN,
+            current_value="on", required=False, target_ref="e3")
+        fresh = NormalizedSnapshot(ApplicationObservation(
+            "fresh", "https://example.test/apply", "Application", questions=(question,)), {})
+        async with PlaywrightMCPAdapter(MCPServerCommand("node", ("cli.js",)),
+                                        client_factory=lambda _: fake) as adapter:
+            updated = await adapter._read_current_control_states(fresh)
+        actual = updated.observation.questions[0]
+        self.assertEqual(actual.control_type, ControlType.TOGGLE)
+        self.assertFalse(actual.answer_state().satisfied)
+        self.assertEqual([name for name, _ in fake.calls], ["browser_evaluate", "browser_close"])
+
+    async def test_targeted_checkbox_ignores_default_on_value_when_unchecked(self):
+        page = '''### Page
+- Page URL: https://example.test/apply
+### Snapshot
+```yaml
+- main [ref=e1]:
+  - heading "Application" [level=2] [ref=e2]
+  - checkbox "I have a preferred name" [ref=e3]
+```
+'''
+
+        class CheckboxClient(FakeClient):
+            async def call_tool(self, name, args):
+                if name == "browser_evaluate" and "target" in args:
+                    self.calls.append((name, args))
+                    return SimpleNamespace(is_error=False, content=[SimpleNamespace(
+                        type="text", text='### Result\n{"kind":"toggle_state","value":"unchecked",'
+                                          '"rawRole":"input","required":false}')])
+                return await super().call_tool(name, args)
+
+        fake = CheckboxClient(None, snapshots=[page])
+        async with PlaywrightMCPAdapter(MCPServerCommand("node", ("cli.js",)),
+                                        client_factory=lambda _: fake) as adapter:
+            question = (await adapter.observe()).questions[0]
+            self.assertEqual(question.control_type.value, "toggle")
+            self.assertEqual(question.current_value, "unchecked")
+            self.assertFalse(question.answer_state().satisfied)
+
+    async def test_multiselect_dom_state_recovers_selection_absent_from_snapshot(self):
+        page = '''### Page
+- Page URL: https://example.test/apply
+### Snapshot
+```yaml
+- main [ref=e1]:
+  - heading "Application" [level=2] [ref=e2]
+  - listbox "Skills" [multiple] [ref=e3]:
+    - option "Example skill" [ref=e4]
+```
+'''
+
+        class SelectedClient(FakeClient):
+            async def call_tool(self, name, args):
+                if name == "browser_evaluate":
+                    self.calls.append((name, args))
+                    if "target" not in args:
+                        return SimpleNamespace(is_error=False, content=[SimpleNamespace(
+                            type="text", text='### Result\n{"candidates":[]}')])
+                    return SimpleNamespace(is_error=False, content=[SimpleNamespace(
+                        type="text", text='### Result\n{"kind":"multi_state","selectedValues":["Example skill"]}')])
+                return await super().call_tool(name, args)
+
+        fake = SelectedClient(None, snapshots=[page])
+        async with PlaywrightMCPAdapter(MCPServerCommand("node", ("cli.js",)),
+                                        client_factory=lambda _: fake) as adapter:
+            observed = await adapter.observe()
+            question = observed.questions[0]
+            self.assertEqual(question.selected_values, ("Example skill",))
+            self.assertTrue(question.answer_state().satisfied)
+        self.assertEqual([name for name, _ in fake.calls],
+                         ["browser_snapshot", "browser_evaluate", "browser_evaluate", "browser_close"])
+
+    async def test_known_resume_upload_uses_configured_synthetic_file_and_verifies(self):
+        page = '''### Page
+- Page URL: https://example.test/apply
+### Snapshot
+```yaml
+- main [ref=e1]:
+  - heading "Application" [level=2] [ref=e2]
+  - button "Upload Resume" [required] [ref=e3]
+```
+'''
+        class UploadClient(FakeClient):
+            uploaded = False
+
+            async def call_tool(self, name, args):
+                if name == "browser_file_upload":
+                    self.calls.append((name, args))
+                    self.uploaded = True
+                    return SimpleNamespace(is_error=False, content=[])
+                if name == "browser_evaluate":
+                    self.calls.append((name, args))
+                    return SimpleNamespace(is_error=False, content=[SimpleNamespace(
+                        type="text", text='### Result\n"synthetic.pdf"' if self.uploaded
+                        else '### Result\nnull')])
+                return await super().call_tool(name, args)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "synthetic.pdf"
+            path.write_bytes(b"%PDF-1.4 synthetic fixture")
+            fake = UploadClient(None, tools=[*TOOLS, tool("browser_file_upload", {"paths"})],
+                                snapshots=[page, page])
+            async with PlaywrightMCPAdapter(MCPServerCommand("node", ("cli.js",)),
+                                            client_factory=lambda _: fake) as adapter:
+                observed = await adapter.observe()
+                self.assertEqual(observed.questions[0].control_type.value, "file")
+                session = ApplicationSession("app", observed.location)
+                session.record_observation(observed)
+                answer = Answer("documents.resume", str(path), AnswerSource.CANDIDATE_PROFILE,
+                                AnswerScope.GLOBAL)
+                action = UploadDocument("e3", observed.observation_id, "documents.resume", answer)
+                result = await adapter.upload_document(action, session)
+                self.assertEqual(result.observation.questions[0].current_value, "synthetic.pdf")
+                with self.assertRaises(PermissionError):
+                    await adapter.upload_document(action, session)
+            self.assertEqual([name for name, _ in fake.calls if name in {
+                "browser_click", "browser_file_upload"}], ["browser_click", "browser_file_upload"])
+            self.assertEqual(next(args["paths"] for name, args in fake.calls
+                                  if name == "browser_file_upload"), [str(path)])
+
+    async def test_toggle_uses_current_ref_then_verifies_fresh_checked_state(self):
+        first = '''### Page
+- Page URL: https://example.test/apply
+### Snapshot
+```yaml
+- main [ref=e1]:
+  - heading "Application" [level=2] [ref=e2]
+  - checkbox "Are you authorized to work in the US?" [required] [ref=e3]
+```
+'''
+        second = first.replace('[required] [ref=e3]', '[checked] [required] [ref=e8]')
+        fake = FakeClient(None, snapshots=[first, second])
+        async with PlaywrightMCPAdapter(MCPServerCommand("node", ("cli.js",)),
+                                        client_factory=lambda _: fake) as adapter:
+            observed = await adapter.observe()
+            session = ApplicationSession("application-1", observed.location)
+            session.record_observation(observed)
+            answer = Answer("employment.us_authorized", "Yes", AnswerSource.CANDIDATE_PROFILE,
+                            AnswerScope.GLOBAL)
+            action = Toggle(observed.questions[0].target_ref, observed.observation_id, answer)
+            result = await adapter.toggle(action, session)
+            self.assertEqual(result.observation.questions[0].current_value, "checked")
+            with self.assertRaises(PermissionError):
+                await adapter.toggle(action, session)
+        self.assertEqual([name for name, _ in fake.calls].count("browser_click"), 1)
+
+    async def test_fresh_targeted_state_read_recovers_manual_choice_without_page_text(self):
+        page = '''### Page
+- Page URL: https://example.test/apply
+### Snapshot
+```yaml
+- main [ref=e1]:
+  - heading "Application" [level=2] [ref=e2]
+  - combobox "How Did You Hear About Us?" [required] [ref=e3]: Select One
+```
+'''
+        class StateClient(FakeClient):
+            value = None
+
+            async def call_tool(self, name, args):
+                if name == "browser_evaluate":
+                    self.calls.append((name, args))
+                    if "target" not in args:
+                        return SimpleNamespace(is_error=False, content=[SimpleNamespace(
+                            type="text", text='### Result\n{"candidates":[]}')])
+                    return SimpleNamespace(is_error=False, content=[SimpleNamespace(
+                        type="text", text="### Result\n" + json.dumps(self.value))])
+                return await super().call_tool(name, args)
+
+        fake = StateClient(None, snapshots=[page, page])
+        async with PlaywrightMCPAdapter(MCPServerCommand("node", ("cli.js",)),
+                                        client_factory=lambda _: fake) as adapter:
+            first = await adapter.observe()
+            self.assertEqual(first.questions[0].current_value, "Select One")
+            fake.value = "Employee Referral"
+            second = await adapter.observe()
+            self.assertEqual(second.questions[0].current_value, "Employee Referral")
+            self.assertNotEqual(first.observation_id, second.observation_id)
+            self.assertEqual(first.questions[0].identity(), second.questions[0].identity())
+        self.assertEqual([name for name, args in fake.calls
+                          if name == "browser_evaluate" and "target" in args], 2 * ["browser_evaluate"])
+        self.assertEqual([name for name, args in fake.calls
+                          if name == "browser_evaluate" and "target" not in args],
+                         2 * ["browser_evaluate"])
+        self.assertFalse(any(name == "browser_click" for name, _ in fake.calls))
+
+    async def test_button_backed_selected_value_is_read_without_any_browser_action(self):
+        page = '''### Page
+- Page URL: https://example.test/apply
+### Snapshot
+```yaml
+- main [ref=e1]:
+  - heading "Application" [level=2] [ref=e2]
+  - generic: Country / Territory Phone Code *
+  - button "Country / Territory Phone Code" [haspopup=listbox] [ref=e3]
+```
+'''
+        class SelectedClient(FakeClient):
+            async def call_tool(self, name, args):
+                if name == "browser_evaluate":
+                    self.calls.append((name, args))
+                    if "target" not in args:
+                        return SimpleNamespace(is_error=False, content=[SimpleNamespace(
+                            type="text", text='### Result\n{"candidates":[]}')])
+                    return SimpleNamespace(is_error=False, content=[SimpleNamespace(
+                        type="text", text='### Result\n"Exampleland (+9)"')])
+                return await super().call_tool(name, args)
+
+        fake = SelectedClient(None, snapshots=[page])
+        async with PlaywrightMCPAdapter(MCPServerCommand("node", ("cli.js",)),
+                                        client_factory=lambda _: fake) as adapter:
+            observed = await adapter.observe()
+            question = observed.questions[0]
+            self.assertTrue(question.required)
+            self.assertEqual(question.current_value, "Exampleland (+9)")
+            self.assertEqual(question.answer_evidence.value, "dom_value")
+            self.assertTrue(question.answer_state().satisfied)
+        self.assertEqual([name for name, _ in fake.calls],
+                         ["browser_snapshot", "browser_evaluate", "browser_evaluate", "browser_close"])
+
+    async def test_targeted_empty_text_clears_misleading_snapshot_value(self):
+        page = '''### Page
+- Page URL: https://example.test/apply
+### Snapshot
+```yaml
+- main [ref=e1]:
+  - heading "Application" [level=2] [ref=e2]
+  - textbox "State" [required] [ref=e3]: California
+```
+'''
+        class EmptyClient(FakeClient):
+            async def call_tool(self, name, args):
+                if name == "browser_evaluate":
+                    self.calls.append((name, args))
+                    return SimpleNamespace(is_error=False, content=[SimpleNamespace(
+                        type="text", text='### Result\n""')])
+                return await super().call_tool(name, args)
+        fake = EmptyClient(None, snapshots=[page])
+        async with PlaywrightMCPAdapter(MCPServerCommand("node", ("cli.js",)),
+                                        client_factory=lambda _: fake) as adapter:
+            question = (await adapter.observe()).questions[0]
+            self.assertIsNone(question.current_value)
+            self.assertFalse(question.answer_state().satisfied)
+
+    async def test_committed_typeahead_matches_linked_selected_suggestion(self):
+        page = '''### Page
+- Page URL: https://example.test/apply
+### Snapshot
+```yaml
+- main [ref=e1]:
+  - heading "Application" [level=2] [ref=e2]
+  - textbox "Committed school" [ref=e3]: Example College
+  - listbox "Suggestions" [ref=e4]:
+    - option "Example College" [selected] [ref=e5]
+```
+'''
+        class LinkedClient(FakeClient):
+            async def call_tool(self, name, args):
+                if name == "browser_evaluate":
+                    self.calls.append((name, args))
+                    if "target" not in args:
+                        return SimpleNamespace(is_error=False, content=[SimpleNamespace(
+                            type="text", text='### Result\n{"candidates":[]}')])
+                    value = ({"kind": "typeahead", "value": "Example College", "listId": "suggestions"}
+                             if args["target"] == "e3" else
+                             {"kind": "listbox", "value": "Example College", "id": "suggestions"})
+                    return SimpleNamespace(is_error=False, content=[SimpleNamespace(
+                        type="text", text="### Result\n" + json.dumps(value))])
+                return await super().call_tool(name, args)
+        fake = LinkedClient(None, snapshots=[page])
+        async with PlaywrightMCPAdapter(MCPServerCommand("node", ("cli.js",)),
+                                        client_factory=lambda _: fake) as adapter:
+            observed = await adapter.observe()
+            self.assertEqual(len(observed.questions), 1)
+            question = observed.questions[0]
+            self.assertEqual(question.options, ("Example College",))
+            self.assertTrue(question.selection_confirmed)
+            self.assertTrue(question.answer_state().satisfied)
+
+    async def test_closed_choice_reveal_clicks_once_and_reobserves_without_answer(self):
+        closed = '''### Page
+- Page URL: https://example.test/apply
+### Snapshot
+```yaml
+- main [ref=e1]:
+  - heading "Application" [level=2] [ref=e2]
+  - generic: State*
+  - button "Select One" [haspopup=listbox] [ref=e3]
+```
+'''
+        opened = closed.replace('  - button "Select One" [haspopup=listbox] [ref=e3]',
+            '  - button "Select One" [haspopup=listbox] [ref=e3]\n'
+            '  - listbox [ref=e4]:\n    - option "California" [ref=e5]')
+        fake = FakeClient(None, snapshots=[closed, opened])
+        async with PlaywrightMCPAdapter(MCPServerCommand("node", ("cli.js",)),
+                                        client_factory=lambda _: fake) as adapter:
+            session = ApplicationSession("app", "https://example.test/apply")
+            first = await adapter.observe(); session.record_observation(first)
+            action = RevealOptions(first.questions[0].target_ref, first.observation_id)
+            result = await adapter.reveal_options(action, session)
+            self.assertEqual(result.observation.questions[0].options, ("California",))
+            with self.assertRaises(PermissionError):
+                await adapter.reveal_options(action, session)
+        self.assertEqual([name for name, _ in fake.calls if name != "browser_evaluate"],
+                         ["browser_snapshot", "browser_click", "browser_snapshot", "browser_close"])
+
+    async def test_empty_snapshot_retries_fresh_observation_without_repeating_navigation(self):
+        fake = FakeClient(None, snapshots=[EMPTY, STEP_1])
+        with patch("jobagent.mcp_browser.asyncio.sleep", new_callable=AsyncMock) as sleep:
+            async with PlaywrightMCPAdapter(MCPServerCommand("node", ("cli.js",)),
+                                            client_factory=lambda _: fake) as adapter:
+                observation = await adapter.navigate("https://example.test/apply")
+                self.assertEqual(observation.observation_id, "observation-2")
+                self.assertEqual(observation.heading, "Basic information")
+                self.assertIsNotNone(adapter.diagnostic_for(observation.observation_id))
+        self.assertEqual([name for name, _ in fake.calls if name != "browser_evaluate"],
+                         ["browser_navigate", "browser_snapshot", "browser_snapshot", "browser_close"])
+        sleep.assert_awaited_once_with(0.5)
+
+    async def test_persistent_empty_snapshot_has_bounded_safe_failure(self):
+        fake = FakeClient(None, snapshots=[EMPTY, EMPTY, EMPTY])
+        with patch("jobagent.mcp_browser.asyncio.sleep", new_callable=AsyncMock) as sleep:
+            async with PlaywrightMCPAdapter(MCPServerCommand("node", ("cli.js",)),
+                                            client_factory=lambda _: fake) as adapter:
+                with self.assertRaises(SnapshotEmpty):
+                    await adapter.navigate("https://example.test/apply")
+                self.assertIsNone(adapter._last)
+        self.assertEqual([name for name, _ in fake.calls],
+                         ["browser_navigate", "browser_snapshot", "browser_snapshot",
+                          "browser_snapshot", "browser_close"])
+        self.assertEqual([call.args for call in sleep.await_args_list], [(0.5,), (1.0,)])
+
+    async def test_access_challenge_is_not_retried(self):
+        fake = FakeClient(None, snapshots=[LOGIN.replace("Sign In", "Verify you are human")])
+        with patch("jobagent.mcp_browser.asyncio.sleep", new_callable=AsyncMock) as sleep:
+            async with PlaywrightMCPAdapter(MCPServerCommand("node", ("cli.js",)),
+                                            client_factory=lambda _: fake) as adapter:
+                with self.assertRaises(SnapshotAccessChallenge):
+                    await adapter.navigate("https://example.test/apply")
+        self.assertEqual([name for name, _ in fake.calls],
+                         ["browser_navigate", "browser_snapshot", "browser_close"])
+        sleep.assert_not_awaited()
+
     async def test_annotation_ref_shared_by_two_fields_is_rejected(self):
         duplicate = STEP_1.replace('textbox "Last name" [ref=e9]',
                                    'textbox "Last name" [ref=e8]')
@@ -78,9 +444,10 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         async with PlaywrightMCPAdapter(MCPServerCommand("node", ("cli.js",)),
                                         client_factory=lambda _: fake) as adapter:
             observation = await adapter.observe()
+            before = len(fake.calls)
             with self.assertRaises(PermissionError):
                 await adapter.annotate_field("e8", observation.observation_id, "needs-review")
-        self.assertFalse(any(name == "browser_evaluate" for name, _ in fake.calls))
+            self.assertEqual(len(fake.calls), before)
 
     async def test_annotation_uses_only_current_unique_field_ref_and_no_form_action(self):
         class AnnotationClient(FakeClient):
@@ -103,7 +470,8 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(PermissionError):
                 await adapter.annotate_field("e8", first.observation_id, "verified")
             await adapter.annotate_field("e8", second.observation_id, "clear")
-        calls = [args for name, args in fake.calls if name == "browser_evaluate"]
+        calls = [args for name, args in fake.calls if name == "browser_evaluate" and
+                 "jobagent-review-style" in args.get("function", "")]
         self.assertEqual(len(calls), 4)
         self.assertEqual({args["target"] for args in calls}, {"e8"})
         self.assertEqual({name for name, _ in fake.calls} - {
@@ -174,9 +542,10 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             result = await adapter.fill_text(action, session)
             self.assertEqual(result.observation.questions[0].current_value, "Ada")
             self.assertEqual(fake.calls[0], ("browser_navigate", {"url": "http://local/fixture"}))
-            self.assertEqual(fake.calls[2], ("browser_type", {"target": "e8", "text": "Ada",
-                                                               "submit": False}))
-            self.assertEqual(fake.calls[3][0], "browser_snapshot")
+            actions = [(name, args) for name, args in fake.calls if name != "browser_evaluate"]
+            self.assertEqual(actions[2], ("browser_type", {"target": "e8", "text": "Ada",
+                                                             "submit": False}))
+            self.assertEqual(actions[3][0], "browser_snapshot")
         self.assertTrue(fake.closed)
         self.assertEqual(fake.calls[-1][0], "browser_close")
 

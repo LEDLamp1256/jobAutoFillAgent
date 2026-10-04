@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import re
+from hashlib import sha256
+from datetime import date
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TypeAlias
@@ -9,11 +13,41 @@ from typing import TypeAlias
 
 class ControlType(str, Enum):
     TEXT = "text"
+    DATE = "date"
     SECRET = "secret"
     CHOICE = "choice"
+    MULTI_CHOICE = "multi_choice"
+    TYPEAHEAD = "typeahead"
     TOGGLE = "toggle"
     FILE = "file"
     UNKNOWN = "unknown"
+
+
+class AnswerEvidence(str, Enum):
+    SNAPSHOT_VALUE = "snapshot_value"
+    SELECTED_OPTION = "selected_option"
+    SELECTED_ITEMS = "selected_items"
+    CHECKED_STATE = "checked_state"
+    BUTTON_SELECTION = "button_selection"
+    DOM_VALUE = "dom_value"
+    DOM_ASSOCIATED = "dom_associated"
+
+
+_EMPTY_ANSWER_CAPTIONS = frozenset({
+    "select", "select one", "select an option", "please select", "please select an option",
+    "choose", "choose one", "choose an option", "please choose", "please choose an option",
+    "none selected", "no selection", "not selected", "-- select --", "no file chosen",
+    "no file selected", "nothing selected",
+    "none", "empty",
+})
+
+
+@dataclass(frozen=True)
+class CurrentAnswerState:
+    value: str | None  # Runtime only; never put this in a report or diagnostic.
+    evidence: AnswerEvidence | None
+    placeholder: bool
+    satisfied: bool
 
 
 class NavigationKind(str, Enum):
@@ -41,6 +75,55 @@ class QuestionObservation:
     required: bool | None = None  # None means the browser did not establish optionality.
     current_value: str | None = None
     target_ref: str | None = None  # Valid only for this browser observation.
+    occurrence: int = 0  # Distinguishes repeated labels within one structural context.
+    selection_confirmed: bool = False  # A typeahead search string alone is not an answer.
+    date_format: str | None = None  # Browser-observed syntax: date, month, or MM/YYYY.
+    answer_evidence: AnswerEvidence | None = None
+    placeholder_text: str | None = None
+    raw_role: str | None = None  # Diagnostic evidence from the current observation only.
+    required_evidence: str | None = None
+    selected_values: tuple[str, ...] = ()  # Explicit live multiselect selections only.
+    discovery_source: str = "accessibility"
+    state_conflict: bool = False
+
+    def answer_state(self) -> CurrentAnswerState:
+        if self.state_conflict:
+            return CurrentAnswerState(None, None, False, False)
+        value = _normalized(self.current_value)
+        placeholder = (not value or value in _EMPTY_ANSWER_CAPTIONS or
+                       value == _normalized(self.label) or
+                       (self.placeholder_text is not None and
+                        value == _normalized(self.placeholder_text)))
+        if self.control_type is ControlType.MULTI_CHOICE:
+            selected = tuple(item.strip() for item in self.selected_values
+                             if _normalized(item) and
+                             _normalized(item) not in _EMPTY_ANSWER_CAPTIONS and
+                             _normalized(item) != _normalized(self.label))
+            return CurrentAnswerState(", ".join(selected) if selected else None,
+                                      self.answer_evidence, not selected, bool(selected))
+        if self.control_type is ControlType.TOGGLE and value == "unchecked":
+            placeholder = True  # Presence of an untouched checkbox is not an answer.
+        if self.control_type is ControlType.DATE and not placeholder:
+            fmt = self.date_format
+            if fmt == "date" or (fmt is None and re.fullmatch(r"\d{4}-\d{2}-\d{2}", value)):
+                try:
+                    date.fromisoformat(value)
+                except ValueError:
+                    placeholder = True
+            elif fmt == "month" or (fmt is None and re.fullmatch(r"\d{4}-\d{2}", value)):
+                placeholder = re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", value) is None
+            elif fmt == "MM/YYYY" or (fmt is None and re.fullmatch(r"\d{2}/\d{4}", value)):
+                placeholder = re.fullmatch(r"(0[1-9]|1[0-2])/\d{4}", value) is None
+            else:
+                placeholder = True  # A partial/unrecognized date needs review.
+        search_only = (self.control_type in {ControlType.TYPEAHEAD, ControlType.CHOICE} and
+                       self.raw_role in {"input", "textbox", "combobox"} and
+                       self.answer_evidence is AnswerEvidence.DOM_VALUE and
+                       not self.selection_confirmed)
+        satisfied = bool(not placeholder and not search_only and
+                         (self.control_type is not ControlType.TYPEAHEAD or self.selection_confirmed))
+        return CurrentAnswerState(self.current_value if satisfied else None,
+                                  self.answer_evidence, placeholder, satisfied)
 
     def identity(self) -> QuestionIdentity:
         """A local descriptor, not a claim of universal semantic equivalence."""
@@ -49,8 +132,69 @@ class QuestionObservation:
             "" if self.semantic_key else _normalized(self.label),
             _normalized(self.section),
             _normalized(self.record_context),
-            self.control_type.value,
+            str(self.occurrence),
         )
+
+    def report_identity(self) -> str:
+        """Stable scoped identity without a live ref, value, or widget type."""
+        return json.dumps(self.identity(), separators=(",", ":"), ensure_ascii=False)
+
+
+# Accessible status text that selector widgets expose while open or after a
+# choice. It names widget state, never an application question.
+SELECTOR_STATUS_LABELS = frozenset({"items selected", "options expanded", "options collapsed"})
+
+
+def is_selector_status_label(label: str | None) -> bool:
+    return " ".join((label or "").casefold().split()) in SELECTOR_STATUS_LABELS
+
+
+def _diagnostic_label(value: str | None) -> str | None:
+    if value is None:
+        return None
+    bounded = value[:160]
+    bounded = re.sub(r"\b[^\s@]+@[^\s@]+\.[^\s@]+\b", "[email]", bounded)
+    bounded = re.sub(r"https?://\S+", "[url]", bounded)
+    bounded = re.sub(r"\b\d{5,}\b", "[number]", bounded)
+    return bounded
+
+
+def current_field_diagnostic(question: QuestionObservation, *, automation_supported: bool,
+                             blocking: bool, report_group: str | None = None,
+                             manual_resolution: str | None = None) -> dict[str, object]:
+    """Opt-in, value-free local trace for one fresh logical question.
+
+    ``satisfied`` and ``blocking`` always describe the fresh machine
+    observation; a human attestation is reported beside them, never merged in.
+    """
+    answer = question.answer_state()
+    return {
+        "label": _diagnostic_label(question.label),
+        "question_identity": sha256(question.report_identity().encode()).hexdigest()[:16],
+        "section": _diagnostic_label(question.section),
+        "record_context": _diagnostic_label(question.record_context),
+        "raw_role": question.raw_role,
+        "interaction_kind": question.control_type.value,
+        "requiredness": ("required" if question.required is True else
+                         "optional" if question.required is False else "unknown"),
+        "current_value_present": answer.satisfied,
+        "search_text_present": (question.control_type in {ControlType.TYPEAHEAD, ControlType.CHOICE}
+                                and question.raw_role in {"input", "textbox", "combobox"}
+                                and bool(question.current_value) and not answer.placeholder
+                                and not answer.satisfied),
+        "committed_selection_present": (question.control_type in {ControlType.TYPEAHEAD,
+                                                                    ControlType.CHOICE} and answer.satisfied),
+        "required_evidence": question.required_evidence,
+        "current_answer": "[redacted]" if answer.satisfied else None,
+        "answer_evidence": answer.evidence.value if answer.evidence else None,
+        "placeholder": answer.placeholder, "satisfied": answer.satisfied,
+        "automation_capability": "supported" if automation_supported else "unsupported",
+        "resolver_capability": "not_evaluated",
+        "blocking": blocking, "report_group": report_group,
+        "manual_resolution": manual_resolution,
+        "discovery_source": question.discovery_source,
+        "state_conflict": question.state_conflict,
+    }
 
 
 @dataclass(frozen=True)
@@ -58,6 +202,22 @@ class NavigationControl:
     label: str
     kind: NavigationKind = NavigationKind.UNKNOWN
     target_ref: str | None = None
+
+
+@dataclass(frozen=True)
+class SectionAction:
+    label: str
+    section: str | None = None
+    target_ref: str | None = None  # Current observation only.
+
+
+@dataclass(frozen=True)
+class DiscoverySummary:
+    raw_actionable_count: int = 0
+    accessibility_question_count: int = 0
+    dom_recovered_field_count: int = 0
+    ignored_reasons: tuple[tuple[str, int], ...] = ()
+    truncated: bool = False
 
 
 @dataclass(frozen=True)
@@ -70,10 +230,39 @@ class ApplicationObservation:
     validation_messages: tuple[str, ...] = ()
     navigation_controls: tuple[NavigationControl, ...] = ()
     review_like: bool = False
+    job_title: str | None = None
+    company: str | None = None
+    section_actions: tuple[SectionAction, ...] = ()
+    discovery_summary: DiscoverySummary | None = None
+    # Form-step heading shown between the page heading and the first field
+    # (for example "My Information" under a job-title heading).
+    checkpoint: str | None = None
 
     def __post_init__(self) -> None:
         if not self.observation_id.strip():
             raise ValueError("observation_id must be nonempty")
+
+
+PAGE_SCOPE_SEPARATOR = " › "
+
+
+def page_scope(observation: ApplicationObservation) -> str | None:
+    """Durable per-task page/checkpoint key; never uses live refs or DOM ids.
+
+    An explicit progress indicator wins. Otherwise the step heading refines
+    the page heading, because some ATS pages keep the job title as their only
+    stable top heading across every step.
+    """
+    if observation.progress_text:
+        return observation.progress_text
+    if observation.checkpoint and observation.heading and observation.checkpoint != observation.heading:
+        return f"{observation.heading}{PAGE_SCOPE_SEPARATOR}{observation.checkpoint}"
+    return observation.heading or observation.checkpoint
+
+
+def is_coarser_page_scope(older: str | None, newer: str | None) -> bool:
+    """True when ``older`` is the pre-checkpoint key that ``newer`` refines."""
+    return bool(older and newer and newer.startswith(older + PAGE_SCOPE_SEPARATOR))
 
 
 @dataclass(frozen=True)
@@ -86,11 +275,17 @@ class ObservationFingerprint:
 def semantic_fingerprint(observation: ApplicationObservation) -> ObservationFingerprint:
     questions = tuple(sorted((
         q.identity(),
+        q.control_type.value,
         tuple(_normalized(option) for option in q.options),
         q.required,
         _normalized(q.current_value),
+        tuple(_normalized(value) for value in q.selected_values),
+        q.selection_confirmed,
+        q.date_format,
     ) for q in observation.questions))
     controls = tuple(sorted((c.kind.value, _normalized(c.label)) for c in observation.navigation_controls))
+    section_actions = tuple(sorted((_normalized(c.section), _normalized(c.label))
+                                   for c in observation.section_actions))
     return ObservationFingerprint((
         _normalized(observation.location),
         _normalized(observation.heading),
@@ -98,6 +293,7 @@ def semantic_fingerprint(observation: ApplicationObservation) -> ObservationFing
         questions,
         tuple(sorted(_normalized(message) for message in observation.validation_messages)),
         controls,
+        section_actions,
         observation.review_like,
     ))
 
@@ -166,6 +362,19 @@ class ChooseOption:
 
 
 @dataclass(frozen=True)
+class RevealOptions:
+    target_ref: str
+    observation_id: str
+
+
+@dataclass(frozen=True)
+class SearchOptions:
+    target_ref: str
+    observation_id: str
+    answer: Answer
+
+
+@dataclass(frozen=True)
 class Toggle:
     target_ref: str
     observation_id: str
@@ -198,7 +407,7 @@ class Submit:
     observation_id: str
 
 
-RoutineAction: TypeAlias = FillText | ChooseOption | Toggle | UploadDocument | Advance | GoBack
+RoutineAction: TypeAlias = FillText | ChooseOption | RevealOptions | SearchOptions | Toggle | UploadDocument | Advance | GoBack
 ApplicationAction: TypeAlias = RoutineAction | Submit
 
 
@@ -434,15 +643,23 @@ class ActionPolicy:
         if len(matching_questions) != 1:
             raise PermissionError("question target missing or ambiguous")
         question = matching_questions[0]
+        if isinstance(action, RevealOptions):
+            if question.control_type is not ControlType.CHOICE or question.options:
+                raise PermissionError("option reveal requires an observed closed choice")
+            return None
         if question.semantic_key and question.semantic_key != action.answer.semantic_key:
             raise PermissionError("answer does not match question identity")
         if not action.answer.safe_for_automatic_fill(session.application_id):
             raise PermissionError("answer is uncertain, unapproved, or out of scope")
         expected_type = (ControlType.TEXT if isinstance(action, FillText) else
                          ControlType.CHOICE if isinstance(action, ChooseOption) else
+                         ControlType.TYPEAHEAD if isinstance(action, SearchOptions) else
                          ControlType.TOGGLE if isinstance(action, Toggle) else ControlType.FILE)
-        if question.control_type is not expected_type:
+        if not (question.control_type is expected_type or
+                (isinstance(action, FillText) and question.control_type is ControlType.DATE) or
+                (isinstance(action, ChooseOption) and question.control_type is ControlType.TYPEAHEAD)):
             raise PermissionError("action does not match the observed control type")
-        if isinstance(action, ChooseOption) and question.options and action.answer.value not in question.options:
+        if isinstance(action, ChooseOption) and (
+                not question.options or action.answer.value not in question.options):
             raise PermissionError("chosen answer is not an observed option")
         return None

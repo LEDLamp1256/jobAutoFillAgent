@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 /// One backend child and one outstanding request at a time. Stdout is protocol only.
 public actor ControlPlaneProcess: ControlPlaneClient {
@@ -7,6 +8,8 @@ public actor ControlPlaneProcess: ControlPlaneClient {
     private var input: FileHandle?
     private var output: FileHandle?
     private var currentState: BackendConnection = .disconnected
+    private var timedOutRequestIDs: Set<String> = []
+    private var lineBuffer = Data()
 
     public init(configuration: BackendConfiguration) {
         self.configuration = configuration
@@ -103,19 +106,38 @@ public actor ControlPlaneProcess: ControlPlaneClient {
             throw ControlClientError.unavailable
         }
         let requestID = UUID().uuidString
+        let diagnostic: Bool
+        if case .diagnoseCurrentFields = operation { diagnostic = true }
+        else { diagnostic = false }
+        let deadline = ProcessInfo.processInfo.systemUptime + (diagnostic ? 15 : 60)
         do {
             try input.write(contentsOf: operation.encodedLine(id: requestID))
-            guard let line = try readLine(from: output) else {
-                currentState = .disconnected
-                throw ControlClientError.unavailable
+            while true {
+                let line: Data
+                do {
+                    guard let next = try readLine(from: output, deadline: deadline) else {
+                        currentState = .disconnected
+                        throw ControlClientError.unavailable
+                    }
+                    line = next
+                } catch ControlClientError.diagnosticTimeout {
+                    timedOutRequestIDs.insert(requestID)
+                    throw diagnostic ? ControlClientError.diagnosticTimeout : ControlClientError.requestTimeout
+                }
+                let responseID = try JSONDecoder.controlPlane.decode(ResponseID.self, from: line).id
+                if let responseID, timedOutRequestIDs.remove(responseID) != nil {
+                    continue
+                }
+                let envelope = try JSONDecoder.controlPlane.decode(ResponseEnvelope<T>.self, from: line)
+                guard envelope.id == requestID else { throw ControlClientError.protocolMismatch }
+                if let error = envelope.error { throw ControlClientError.backend(error) }
+                guard envelope.ok, let result = envelope.result else { throw ControlClientError.protocolMismatch }
+                return result
             }
-            let envelope = try JSONDecoder.controlPlane.decode(ResponseEnvelope<T>.self, from: line)
-            guard envelope.id == requestID else { throw ControlClientError.protocolMismatch }
-            if let error = envelope.error { throw ControlClientError.backend(error) }
-            guard envelope.ok, let result = envelope.result else { throw ControlClientError.protocolMismatch }
-            return result
         } catch let error as ControlClientError {
             if case .backend = error { throw error }
+            if case .diagnosticTimeout = error { throw error }
+            if case .requestTimeout = error { throw error }
             currentState = .disconnected
             throw error
         } catch {
@@ -124,14 +146,32 @@ public actor ControlPlaneProcess: ControlPlaneClient {
         }
     }
 
-    private func readLine(from handle: FileHandle) throws -> Data? {
-        var line = Data()
-        while line.count <= 1_048_576 {
-            guard let byte = try handle.read(upToCount: 1), !byte.isEmpty else {
-                return nil
+    private func readLine(from handle: FileHandle, deadline: TimeInterval? = nil) throws -> Data? {
+        while lineBuffer.count <= 1_048_576 {
+            if let newline = lineBuffer.firstIndex(of: 0x0A) {
+                let line = Data(lineBuffer[..<newline])
+                lineBuffer.removeSubrange(...newline)
+                return line
             }
-            if byte[0] == 0x0A { return line }
-            line.append(byte)
+            if let deadline {
+                let remaining = deadline - ProcessInfo.processInfo.systemUptime
+                if remaining <= 0 { throw ControlClientError.diagnosticTimeout }
+                var descriptor = pollfd(fd: handle.fileDescriptor, events: Int16(POLLIN), revents: 0)
+                let ready = Darwin.poll(&descriptor, 1, Int32(min(remaining * 1000, 2_147_483_647)))
+                if ready == 0 { throw ControlClientError.diagnosticTimeout }
+                if ready < 0 {
+                    if errno == EINTR { continue }
+                    throw ControlClientError.transport("Backend diagnostic response could not be read.")
+                }
+            }
+            var bytes = [UInt8](repeating: 0, count: 4096)
+            let count = Darwin.read(handle.fileDescriptor, &bytes, 4096)
+            if count == 0 { return nil }
+            if count < 0 {
+                if errno == EINTR { continue }
+                throw ControlClientError.transport("Backend response could not be read.")
+            }
+            lineBuffer.append(contentsOf: bytes[..<count])
         }
         throw ControlClientError.protocolMismatch
     }
@@ -150,6 +190,12 @@ public actor ControlPlaneProcess: ControlPlaneClient {
         input = nil
         output = nil
         process = nil
+        timedOutRequestIDs.removeAll()
+        lineBuffer.removeAll()
         currentState = .disconnected
     }
+}
+
+private struct ResponseID: Decodable {
+    let id: String?
 }

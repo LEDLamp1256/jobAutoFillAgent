@@ -24,16 +24,24 @@ from .runtime_worker import LaunchAndLoginWorker, LocalLoginConfiguration
 
 
 _PARAMETERS = {
+    "start_application_url": (frozenset({"url"}), frozenset()),
     "list_runs": (frozenset(), frozenset()),
     "get_run": (frozenset({"run_id"}), frozenset()),
     "list_applications": (frozenset(), frozenset({"run_id"})),
     "get_application": (frozenset({"task_id"}), frozenset()),
     "list_attention_required": (frozenset(), frozenset({"run_id"})),
     "get_application_report": (frozenset({"task_id"}), frozenset()),
+    "diagnose_current_fields": (frozenset({"task_id"}), frozenset()),
     "get_narrative_entries": (frozenset({"task_id"}), frozenset()),
     "resume_application": (frozenset({"task_id"}), frozenset()),
+    "resume_and_reconcile": (frozenset({"task_id"}), frozenset()),
+    "open_application": (frozenset({"task_id"}), frozenset()),
+    "recover_application": (frozenset({"task_id"}), frozenset()),
+    "archive_application": (frozenset({"task_id"}), frozenset()),
     "bring_window_to_front": (frozenset({"task_id"}), frozenset()),
     "review_report_entry": (frozenset({"entry_id"}), frozenset()),
+    "resolve_field": (frozenset({"entry_id"}), frozenset()),
+    "undo_field_resolution": (frozenset({"entry_id"}), frozenset()),
     "mark_final_review_checked": (frozenset({"task_id"}), frozenset()),
     "record_submission": (frozenset({"task_id"}), frozenset()),
     "replace_narrative": (frozenset({"entry_id", "text"}), frozenset()),
@@ -60,7 +68,7 @@ def _validate(request: object) -> tuple[str, str, dict]:
     for key, value in params.items():
         if not isinstance(value, str) or not value.strip():
             raise _bad_request(f"{key} must be a nonempty string")
-        if len(value) > (10000 if key == "text" else 128):
+        if len(value) > (10000 if key == "text" else 2048 if key == "url" else 128):
             raise _bad_request(f"{key} exceeds maximum length")
     return request_id, method, params
 
@@ -72,16 +80,24 @@ def dispatch(request: object, control: LocalControlPlane) -> dict:
         request_id, method, params = _validate(request)
         # Explicit allowlist. No caller-selected actor/action, reflection, or generic Submit.
         operations = {
+            "start_application_url": control.start_application_url,
             "list_runs": control.list_runs,
             "get_run": control.get_run,
             "list_applications": control.list_applications,
             "get_application": control.get_application,
             "list_attention_required": control.list_attention_required,
             "get_application_report": control.get_application_report,
+            "diagnose_current_fields": control.diagnose_current_fields,
             "get_narrative_entries": control.get_narrative_entries,
             "resume_application": control.resume_application,
+            "resume_and_reconcile": control.resume_and_reconcile,
+            "open_application": control.open_application,
+            "recover_application": control.recover_application,
+            "archive_application": control.archive_application,
             "bring_window_to_front": control.bring_window_to_front,
             "review_report_entry": control.review_report_entry,
+            "resolve_field": control.resolve_field,
+            "undo_field_resolution": control.undo_field_resolution,
             "mark_final_review_checked": control.mark_final_review_checked,
             "record_submission": control.record_submission,
             "replace_narrative": control.replace_narrative,
@@ -126,7 +142,8 @@ def progress_running_batch(store: BatchStore, scheduler: ApplicationScheduler,
         if active and (active[0].id, active[0].resume_requested_at) in completed_passes:
             continue
         step = scheduler.step(run.id)
-        if step and step.outcome.kind.value == "progress":
+        if (step and step.outcome.kind.value == "progress" and
+                step.outcome.page_or_step != "page_advanced"):
             completed_passes.add((step.task.id, step.task.resume_requested_at))
         if step:
             # One worker invocation per idle tick across all runs.

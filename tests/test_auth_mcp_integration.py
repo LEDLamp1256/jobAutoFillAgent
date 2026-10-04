@@ -41,7 +41,11 @@ class RealLoginFixtureTest(unittest.IsolatedAsyncioTestCase):
         async with PlaywrightMCPAdapter(command) as browser:
             url = f"http://127.0.0.1:{self.server.server_port}/login_handoff.html"
             initial = await browser.navigate(url)
-            result = await LoginOrchestrator(browser, FakeCredentials()).attempt(
+            class LocalCredentials(FakeCredentials):
+                def destination_is_authorized(self, location, identity):
+                    return location.startswith(f"http://127.0.0.1:{self_port}/")
+            self_port = self.server.server_port
+            result = await LoginOrchestrator(browser, LocalCredentials()).attempt(
                 initial, LoginIdentity("synthetic-account", "user@example.test"))
             self.assertEqual(result.status, LoginStatus.AUTHENTICATED)
             self.assertEqual(result.observation.heading, "Personal Information")

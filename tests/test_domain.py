@@ -2,10 +2,11 @@ import unittest
 from dataclasses import replace
 
 from jobagent.domain import (
-    ActionOutcome, ActionPolicy, ActionStatus, Advance, Answer, AnswerScope,
+    ActionOutcome, ActionPolicy, ActionStatus, Advance, Answer, AnswerEvidence, AnswerScope,
     AnswerSource, ApplicationObservation, ApplicationOutcome, ApplicationSession, ChooseOption,
     ControlType, FillText, GoBack, HumanApproval, NavigationControl, NavigationKind,
-    QuestionObservation, SubmissionPermission, Submit, semantic_fingerprint,
+    QuestionObservation, SubmissionPermission, Submit, current_field_diagnostic,
+    semantic_fingerprint,
 )
 
 
@@ -25,6 +26,94 @@ def review_observation(observation_id="review-a", *, submit_ref="submit-a"):
 
 
 class QuestionTests(unittest.TestCase):
+    def test_normalized_current_answer_across_common_controls(self):
+        cases = (
+            (ControlType.TEXT, "Example", True), (ControlType.TEXT, "  ", False),
+            (ControlType.CHOICE, "No", True), (ControlType.CHOICE, "Select One", False),
+            (ControlType.UNKNOWN, "Exampleland (+9)", True),
+            (ControlType.UNKNOWN, "Country / Territory Phone Code", False),
+            (ControlType.TOGGLE, "checked", True), (ControlType.TOGGLE, "unchecked", False),
+            (ControlType.DATE, "2027-03", True), (ControlType.FILE, "synthetic.pdf", True),
+        )
+        for kind, value, expected in cases:
+            label = "Country / Territory Phone Code" if kind is ControlType.UNKNOWN else "Question"
+            question = QuestionObservation(label, kind, required=True, current_value=value,
+                                           answer_evidence=AnswerEvidence.DOM_VALUE)
+            self.assertEqual(question.answer_state().satisfied, expected, (kind, value))
+        typed = QuestionObservation("School", ControlType.TYPEAHEAD,
+                                    current_value="Example College", selection_confirmed=False)
+        self.assertFalse(typed.answer_state().satisfied)
+        self.assertTrue(replace(typed, selection_confirmed=True).answer_state().satisfied)
+
+    def test_explicit_placeholder_metadata_and_redacted_diagnostic(self):
+        question = QuestionObservation("State", ControlType.CHOICE, required=True,
+                                       current_value="Pick a region", placeholder_text="Pick a region")
+        self.assertTrue(question.answer_state().placeholder)
+        self.assertFalse(question.answer_state().satisfied)
+        answered = replace(question, current_value="California",
+                           answer_evidence=AnswerEvidence.SELECTED_OPTION,
+                           raw_role="button", required_evidence="group_required")
+        diagnostic = current_field_diagnostic(answered, automation_supported=False, blocking=False)
+        self.assertEqual(diagnostic["current_answer"], "[redacted]")
+        self.assertEqual(diagnostic["answer_evidence"], "selected_option")
+        self.assertTrue(diagnostic["satisfied"])
+        self.assertEqual(diagnostic["automation_capability"], "unsupported")
+        self.assertEqual(diagnostic["raw_role"], "button")
+        self.assertEqual(diagnostic["required_evidence"], "group_required")
+        self.assertNotIn("California", repr(diagnostic))
+
+    def test_search_query_is_not_a_committed_choice(self):
+        query = QuestionObservation("How Did You Hear About Us?", ControlType.TYPEAHEAD,
+                                    current_value="LinkedIn", raw_role="input",
+                                    answer_evidence=AnswerEvidence.DOM_VALUE, required=True)
+        self.assertFalse(query.answer_state().satisfied)
+        diagnostic = current_field_diagnostic(query, automation_supported=True, blocking=True)
+        self.assertTrue(diagnostic["search_text_present"])
+        self.assertFalse(diagnostic["committed_selection_present"])
+        self.assertNotIn("LinkedIn", repr(diagnostic))
+        committed = replace(query, control_type=ControlType.CHOICE,
+                            answer_evidence=AnswerEvidence.DOM_ASSOCIATED,
+                            selection_confirmed=True)
+        self.assertTrue(committed.answer_state().satisfied)
+        self.assertTrue(current_field_diagnostic(
+            committed, automation_supported=True, blocking=False)["committed_selection_present"])
+
+    def test_date_current_state_rejects_partial_and_impossible_values(self):
+        cases = (
+            ("date", "2027-03-15", True), ("date", "2027-02-30", False),
+            ("date", "2027-03", False), ("month", "2027-03", True),
+            ("month", "2027-13", False), ("MM/YYYY", "03/2027", True),
+            ("MM/YYYY", "13/2027", False), (None, "2027-03", True),
+            (None, "March 2027", False),
+        )
+        for fmt, value, expected in cases:
+            with self.subTest(format=fmt, value=value):
+                question = QuestionObservation("Start date", ControlType.DATE,
+                                               date_format=fmt, current_value=value,
+                                               required=True)
+                self.assertEqual(question.answer_state().satisfied, expected)
+
+    def test_multiselect_requires_explicit_selected_items_not_status_caption(self):
+        base = QuestionObservation("Skills", ControlType.MULTI_CHOICE, required=True,
+                                   current_value="2 items selected")
+        self.assertFalse(base.answer_state().satisfied)
+        selected = replace(base, selected_values=("Example skill", "Another skill"),
+                           answer_evidence=AnswerEvidence.SELECTED_ITEMS)
+        self.assertTrue(selected.answer_state().satisfied)
+        self.assertEqual(selected.answer_state().value, "Example skill, Another skill")
+        self.assertTrue(current_field_diagnostic(
+            selected, automation_supported=False, blocking=False)["current_value_present"])
+        self.assertFalse(replace(base, selected_values=("Select One",)).answer_state().satisfied)
+
+    def test_placeholder_variants_do_not_suppress_legitimate_choice(self):
+        for caption in ("", "   ", "Select One", "Choose", "Please select",
+                        "None selected", "No selection", "No file chosen",
+                        "No file selected", "Nothing selected", "Country"):
+            question = QuestionObservation("Country", ControlType.CHOICE, current_value=caption)
+            self.assertFalse(question.answer_state().satisfied, caption)
+        self.assertTrue(QuestionObservation("Country", ControlType.CHOICE,
+                                            current_value="None of the above").answer_state().satisfied)
+
     def test_reference_and_label_variation_do_not_define_known_identity(self):
         first = QuestionObservation("First name", ControlType.TEXT,
                                     semantic_key="personal.first_name", target_ref="e1")
@@ -41,6 +130,15 @@ class QuestionTests(unittest.TestCase):
                                     semantic_key="employment.start_date", record_context="Acme")
         second = replace(first, record_context="Other Company")
         self.assertNotEqual(first.identity(), second.identity())
+
+    def test_answer_and_widget_shape_do_not_change_logical_identity(self):
+        first = QuestionObservation("How did you hear about us?", ControlType.UNKNOWN,
+                                    section="Application", target_ref="e1")
+        answered = replace(first, control_type=ControlType.CHOICE,
+                           current_value="Referral", target_ref="new-ref")
+        self.assertEqual(first.identity(), answered.identity())
+        self.assertEqual(first.report_identity(), answered.report_identity())
+        self.assertNotEqual(first.identity(), replace(first, occurrence=1).identity())
 
 
 class AnswerTests(unittest.TestCase):

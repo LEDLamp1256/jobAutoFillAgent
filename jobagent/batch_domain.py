@@ -38,10 +38,14 @@ class HumanActor(str, Enum):
 
 
 class HumanAction(str, Enum):
+    ARCHIVE_APPLICATION = "archive_application"
     RESUME = "resume"
     RESOLVE_DUPLICATE = "resolve_duplicate"
     REVIEW_ENTRY = "review_entry"
     PROVIDE_ANSWER = "provide_answer"
+    RESOLVE_FIELD = "resolve_field"
+    UNDO_FIELD_RESOLUTION = "undo_field_resolution"
+    RECOVER_APPLICATION = "recover_application"
     REPLACE_NARRATIVE = "replace_narrative"
     FINAL_REVIEW = "final_review"
     RECORD_SUBMISSION = "record_submission"
@@ -72,6 +76,7 @@ class HumanActionRecord:
 class Blocker(str, Enum):
     NEEDS_ANSWER = "needs_answer"
     UNSUPPORTED_CONTROL = "unsupported_control"
+    BROWSER_TIMEOUT = "browser_timeout"
     MFA_REQUIRED = "mfa_required"
     CAPTCHA_REQUIRED = "captcha_required"
     LOGIN_REQUIRED = "login_required"
@@ -83,6 +88,26 @@ class FailureReason(str, Enum):
     SITE_ERROR = "site_error"
     UNSUPPORTED_FLOW = "unsupported_flow"
     UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class FailureDiagnostic:
+    stage: str
+    category: str
+    detail: str
+    mode: str = "run"
+
+
+@dataclass(frozen=True)
+class FailureEvent:
+    id: str
+    task_id: str
+    reason: str
+    stage: str
+    category: str
+    detail: str
+    mode: str
+    occurred_at: str
 
 
 class Provenance(str, Enum):
@@ -183,10 +208,14 @@ class ReportEntry:
     reason: str | None
     created_at: str
     narrative_text: str | None = None
+    requiredness: str | None = None  # None is a non-question report entry.
+    question_identity: str | None = None
 
     def __post_init__(self) -> None:
         if not self.visible_label.strip() or not self.action.strip():
             raise ValueError("report label and action are required")
+        if self.requiredness not in {None, "required", "optional", "unknown"}:
+            raise ValueError("report requiredness must be a bounded state")
         if self.narrative_text is not None and self.kind is not ReportKind.NARRATIVE:
             raise ValueError("only narrative entries may retain text")
         if self.provenance is Provenance.AI_DRAFT_REVIEW:

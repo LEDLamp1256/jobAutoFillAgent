@@ -1,10 +1,12 @@
 """Offline V2-10 window, launcher, control-plane, and login integration tests."""
 
+import asyncio
 import json
 import io
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
@@ -15,12 +17,40 @@ from jobagent.batch_domain import Blocker, HumanAction, HumanActor, HumanAuthori
 from jobagent.control_plane import LocalControlPlane
 from jobagent.dedupe import ListingInput
 from jobagent.domain import ApplicationObservation, NavigationControl
-from jobagent.managed_runtime import MCPManagedWindows
+from jobagent.managed_runtime import MCPManagedWindows, _Session
 from jobagent.mcp_browser import MCPServerCommand
 from jobagent.persistence import BatchStore
 from jobagent.runtime_worker import LaunchAndLoginWorker, LocalLoginConfiguration
 from jobagent.scheduler import ApplicationScheduler
 from tests.test_authentication import FakeAuthBrowser, SECRET, application_observation
+
+
+class SessionTimeoutTests(unittest.TestCase):
+    def test_timed_out_browser_operation_cannot_continue_to_next_action(self):
+        session = _Session()
+        cancelled = threading.Event()
+        actions = []
+
+        async def work():
+            try:
+                await asyncio.sleep(1)
+                actions.append("next field")
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        async def observe():
+            actions.append("fresh observation")
+
+        try:
+            with self.assertRaisesRegex(RuntimeError, "managed browser operation timed out"):
+                session.run(work(), timeout=0.01)
+            self.assertTrue(cancelled.wait(1))
+            self.assertEqual(actions, [])
+            session.run(observe())
+            self.assertEqual(actions, ["fresh observation"])
+        finally:
+            session.close()
 
 
 class FakeManagedBrowser(FakeAuthBrowser):

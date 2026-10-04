@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Local DOM fallback fixture</title></head>
+<body><main><h2>Application</h2>
+  <div role="group" aria-label="Country / Territory Phone Code" aria-required="true">
+    <label for="phone-code">Country / Territory Phone Code *</label>
+    <input id="phone-code" role="combobox" value="" aria-controls="phone-selection">
+    <button type="button">Country / Territory Phone Code</button>
+    <div id="phone-selection" aria-label="items selected" aria-hidden="true">
+      <span role="option" aria-selected="true">Exampleland (+9)</span>
+    </div>
+  </div>
+  <div role="group" aria-label="How Did You Hear About Us?" aria-required="true">
+    <label for="referral">How Did You Hear About Us? *</label>
+    <input id="referral" role="combobox" value="" aria-controls="referral-selection">
+    <button type="button" id="referral-button" onclick="document.getElementById('referral-selection').innerHTML='<span role=option aria-selected=true>Example source</span>'">Select One</button>
+    <div id="referral-selection" aria-label="items selected" aria-hidden="true"></div>
+  </div>
+  <div role="group" aria-label="State / Province" aria-required="true" aria-hidden="true">
+    <span>State / Province *</span>
+    <button type="button" id="state-button" onclick="this.textContent='California'">Select One</button>
+  </div>
+  <div role="group" aria-label="Marker Required" aria-hidden="true">
+    <span>Marker Required *</span><button type="button">Select One</button>
+  </div>
+  <label>I have a preferred name <input type="checkbox" value="on"></label>
+  <label>Previously contacted <input type="checkbox" value="on" checked></label>
+  <button type="button">Add</button>
+  <button type="button">Save and Continue</button>
+  <button type="button">Submit Application</button>
+</main></body></html>

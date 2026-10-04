@@ -197,6 +197,19 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(scheduler.step().task.id, b.id)
         self.assertEqual(scheduler.step().task.id, a.id)
 
+    def test_last_blocker_clears_only_after_successful_fresh_progress(self):
+        task = self.queue("retain-until-observed")
+        scheduler = self.scheduler([
+            WorkerOutcome(WorkerYield.HUMAN_BLOCKED, blocker=Blocker.UNSUPPORTED_CONTROL,
+                          page_or_step="Application"),
+            WorkerOutcome(WorkerYield.PROGRESS, page_or_step="page_advanced"),
+        ])
+        self.assertEqual(scheduler.step().task.blocker, Blocker.UNSUPPORTED_CONTROL)
+        resumed = scheduler.resume_application(task.id, owner(HumanAction.RESUME))
+        self.assertEqual(resumed.blocker, Blocker.UNSUPPORTED_CONTROL)
+        self.assertEqual(scheduler.step().task.blocker, None)
+        self.assertTrue(self.worker.requests[-1].fresh_observation_required)
+
     def test_failed_task_releases_window_and_capacity(self):
         a, b = self.queue("a"), self.queue("b")
         scheduler = self.scheduler([
@@ -226,6 +239,31 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(len(recovered_worker.requests), 1)
         self.assertTrue(recovered_worker.requests[0].fresh_observation_required)
         self.assertIsNone(result.task.submitted_at)
+
+    def test_explicit_resume_reopens_a_known_closed_managed_window(self):
+        class ClosedWindows(FakeWindows):
+            closed = None
+
+            def exists(self, window_id):
+                return window_id != self.closed and super().exists(window_id)
+
+            def recoverable_closed(self, window_id):
+                return window_id == self.closed
+
+        self.windows = ClosedWindows()
+        task = self.queue("closed")
+        scheduler = self.scheduler([
+            WorkerOutcome(WorkerYield.HUMAN_BLOCKED, blocker=Blocker.LOGIN_REQUIRED),
+            WorkerOutcome(WorkerYield.HUMAN_BLOCKED, blocker=Blocker.LOGIN_REQUIRED),
+        ])
+        first = scheduler.step()
+        old = first.task.browser_session_id
+        self.windows.closed = old
+        scheduler.resume_application(task.id, owner(HumanAction.RESUME))
+        reopened = scheduler.step()
+        self.assertNotEqual(reopened.task.browser_session_id, old)
+        self.assertEqual(reopened.task.status, TaskStatus.HUMAN_PAUSED)
+        self.assertTrue(self.worker.requests[-1].fresh_observation_required)
 
     def test_missing_paused_and_review_windows_do_not_consume_capacity_after_restart(self):
         a, b, c = (self.queue(name) for name in ("a", "b", "c"))

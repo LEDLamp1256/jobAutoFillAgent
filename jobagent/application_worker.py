@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol
 
-from .batch_domain import ApplicationTask, Blocker, FailureReason, Provenance, Verification
+from .batch_domain import ApplicationTask, Blocker, FailureDiagnostic, FailureReason, Provenance, Verification
 
 
 class WorkerYield(str, Enum):
@@ -24,6 +24,8 @@ class ReviewIssue:
     reason: str
     page_or_step: str | None = None
     semantic_key: str | None = None
+    requiredness: str | None = None
+    question_identity: str | None = None
 
 
 @dataclass(frozen=True)
@@ -34,6 +36,8 @@ class FieldAudit:
     action: str
     provenance: Provenance
     verification: Verification
+    requiredness: str | None = None
+    question_identity: str | None = None
 
 
 @dataclass(frozen=True)
@@ -45,6 +49,7 @@ class WorkerOutcome:
     page_or_step: str | None = None
     audits: tuple[FieldAudit, ...] = ()
     report_persisted: bool = False
+    failure_diagnostic: FailureDiagnostic | None = None
 
     def __post_init__(self) -> None:
         if self.kind is WorkerYield.HUMAN_BLOCKED and self.blocker is None:
@@ -55,6 +60,8 @@ class WorkerOutcome:
             raise ValueError("blocker only belongs to human-blocked outcome")
         if self.kind is not WorkerYield.FAILED and self.failure is not None:
             raise ValueError("failure reason only belongs to failed outcome")
+        if self.kind not in {WorkerYield.FAILED, WorkerYield.HUMAN_BLOCKED} and self.failure_diagnostic is not None:
+            raise ValueError("diagnostic requires a failure or human attention outcome")
         if self.kind not in {WorkerYield.HUMAN_BLOCKED, WorkerYield.READY_FOR_REVIEW} and self.issues:
             raise ValueError("issues require a human attention outcome")
 
