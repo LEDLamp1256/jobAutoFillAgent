@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping, Protocol
@@ -52,7 +52,7 @@ class CandidateProfile:
                 raise ProfileError(f"{key} must be a list of objects")
         if "address" in data["personal_info"] and not isinstance(data["personal_info"]["address"], dict):
             raise ProfileError("personal_info.address must be an object")
-        for key in ("full_name", "first_name", "last_name", "preferred_name", "email", "phone",
+        for key in ("full_name", "first_name", "middle_name", "last_name", "preferred_name", "email", "phone",
                     "linkedin_url", "github_url", "portfolio_url"):
             if key in data["personal_info"] and not isinstance(data["personal_info"][key], str):
                 raise ProfileError(f"personal_info.{key} must be text")
@@ -104,28 +104,31 @@ def _norm(value: str | None) -> str:
 _ALIASES: dict[str, tuple[str, ...]] = {
     "personal.first_name": ("first name", "legal first name", "given name", "confirm first name"),
     "personal.last_name": ("last name", "legal last name", "family name", "surname"),
+    "personal.middle_name": ("middle name", "legal middle name"),
     "personal.full_name": ("full name", "legal name", "legal full name"),
     "personal.preferred_name": ("preferred name", "preferred first name"),
     "personal.email": ("email", "email address", "e mail address", "confirm email", "confirm email address"),
     "personal.phone": ("phone", "phone number", "mobile phone", "telephone number"),
     "personal.address.street": ("street address", "address line 1", "street address line 1"),
     "personal.address.city": ("city", "city of residence"),
-    "personal.address.state": ("state", "state province", "state or province"),
+    "personal.address.state": ("state", "state province", "state or province", "state province region"),
     "personal.address.postal": ("zip code", "postal code", "zip postal code"),
     "personal.address.country": ("country", "country of residence"),
     "personal.linkedin": ("linkedin", "linkedin url", "linkedin profile"),
     "personal.github": ("github", "github url", "github profile"),
     "personal.portfolio": ("portfolio", "portfolio url", "personal website"),
     "employment.us_authorized": ("are you authorized to work in the us", "are you legally authorized to work in the united states", "authorized to work in the united states", "us work authorization"),
-    "employment.sponsorship": ("do you require visa sponsorship", "will you require visa sponsorship", "will you now or in the future require sponsorship for employment visa status", "requires visa sponsorship"),
-    "employment.relocation": ("are you willing to relocate", "willing to relocate"),
+    "employment.sponsorship": ("do you require visa sponsorship", "will you require visa sponsorship", "will you now or in the future require sponsorship for employment visa status", "requires visa sponsorship", "do you now or in the future require any immigration filing or visa sponsorship to maintain work authorization"),
+    "employment.relocation": ("are you willing to relocate", "willing to relocate", "would you consider relocating for this role"),
+    "employment.previously_worked_here": ("have you previously worked here",),
     "employment.current": ("are you currently employed",),
     "employment.current_employer": ("current employer",),
-    "education.institution": ("school", "school name", "institution", "institution name", "university"),
+    "education.institution": ("school", "school name", "institution", "institution name", "university", "school or university"),
     "education.degree": ("degree", "degree earned"),
     "education.gpa": ("gpa", "grade point average"),
     "documents.resume": ("resume", "resume cv", "cv", "upload resume", "upload cv"),
     "desired_salary": ("desired salary", "salary expectation", "expected salary"),
+    "how_did_you_hear_about_us": ("how did you hear about us",),
     "why_this_company": ("why do you want to work here", "why do you want to work for this company"),
     "why_this_role": ("why are you interested in this role",),
     "eeo_gender": ("gender", "gender identity"),
@@ -135,7 +138,8 @@ _ALIASES: dict[str, tuple[str, ...]] = {
 }
 _LOOKUP = {alias: key for key, aliases in _ALIASES.items() for alias in aliases}
 _PROFILE_KEYS = {key for key in _ALIASES if key.startswith(("personal.", "employment.", "education.", "documents."))}
-_GLOBAL_KEYS = {key for key in _PROFILE_KEYS if not key.startswith("education.")}
+_GLOBAL_KEYS = {key for key in _PROFILE_KEYS if not key.startswith("education.") and
+                key != "employment.previously_worked_here"}
 _SENSITIVE_KEYS = {key for key in _ALIASES if key.startswith("eeo_")}
 
 
@@ -217,7 +221,7 @@ def _profile_value(profile: CandidateProfile, key: str, question: QuestionObserv
         "employment.sponsorship": "requires_visa_sponsorship",
         "employment.relocation": "willing_to_relocate",
     }
-    if key in {"personal.first_name", "personal.last_name"}:
+    if key in {"personal.first_name", "personal.last_name", "personal.middle_name"}:
         return personal.get(key.removeprefix("personal."))
     if key.startswith("personal.address."):
         address = personal.get("address", {})
@@ -273,6 +277,16 @@ class DeterministicAnswerResolver:
             return Resolution(ResolutionStatus.UNRESOLVED, canonical, reason=canonical.reason)
         return self.resolve_known_key(question, application_id, canonical)
 
+    def resolve_closed_choice(self, question: QuestionObservation,
+                              application_id: str) -> Resolution:
+        """Check for a trusted candidate before opening a choice with no live options."""
+        if question.control_type is not ControlType.CHOICE or question.options:
+            raise ValueError("closed-choice probe requires an unopened choice")
+        # The normal resolver requires live options before allowing selection.
+        # This probe authorizes only revealing options; the fresh open choice
+        # must still pass exact option matching before any selection.
+        return self.resolve(replace(question, control_type=ControlType.TEXT), application_id)
+
     def resolve_known_key(self, question: QuestionObservation, application_id: str,
                           canonical: CanonicalResult) -> Resolution:
         """Retrieve a trusted value for a code-validated semantic mapping."""
@@ -306,10 +320,10 @@ class DeterministicAnswerResolver:
                 return Resolution(ResolutionStatus.UNRESOLVED, canonical,
                                   reason="Q&A answer is not configured")
             scope_text = entry.get("scope")
-            if key in {"why_this_company", "why_this_role"}:
+            if key in {"why_this_company", "why_this_role", "employment.previously_worked_here"}:
                 if scope_text != "application" or entry.get("application_id") != application_id:
                     return Resolution(ResolutionStatus.REQUIRES_REVIEW, canonical,
-                                      reason="narrative answer requires explicit application scope")
+                                      reason="answer requires explicit application scope")
             elif scope_text == "application" and entry.get("application_id") != application_id:
                 return Resolution(ResolutionStatus.UNRESOLVED, canonical, reason="Q&A answer belongs to another application")
             if isinstance(entry.get("answer"), str) and re.search(r"\[[^]]+\]", entry["answer"]):
@@ -328,6 +342,9 @@ class DeterministicAnswerResolver:
     @staticmethod
     def _finish(question: QuestionObservation, canonical: CanonicalResult, answer: Answer,
                 application_id: str, raw_value: Any | None = None) -> Resolution:
+        if question.control_type is ControlType.CHOICE and not question.options:
+            return Resolution(ResolutionStatus.UNRESOLVED, canonical,
+                              reason="live options unavailable")
         value = _option_value(answer.value if raw_value is None else raw_value, question.options)
         if value is None:
             return Resolution(ResolutionStatus.UNRESOLVED, canonical, reason="value does not unambiguously match options")
@@ -351,6 +368,10 @@ class DeterministicAsyncResolver:
 
     async def resolve(self, question: QuestionObservation, application_id: str) -> Resolution:
         return self.resolver.resolve(question, application_id)
+
+    async def resolve_closed_choice(self, question: QuestionObservation,
+                                    application_id: str) -> Resolution:
+        return self.resolver.resolve_closed_choice(question, application_id)
 
     def record_answer(self, answer: Answer) -> None:
         self.resolver.record_answer(answer)

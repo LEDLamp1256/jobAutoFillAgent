@@ -69,6 +69,30 @@ class ProfileTests(unittest.TestCase):
             CandidateProfile.from_mapping({**data, "qa_bank": {"desired_salary": {"notes": "missing"}}})
 
 
+    def test_california_matches_only_a_live_state_option(self):
+        data = profile_data()
+        data["personal_info"]["address"]["state"] = "California"
+        resolver = DeterministicAnswerResolver(CandidateProfile.from_mapping(data))
+        observed = question("State/Province", control=ControlType.CHOICE,
+                            options=("Select One", "California", "Colorado"))
+        result = resolver.resolve(observed, "application-1")
+        self.assertEqual(result.status, ResolutionStatus.SAFE_TO_FILL)
+        self.assertEqual(result.answer.value, "California")
+        self.assertEqual(resolver.resolve(replace(observed, options=()), "application-1").status,
+                         ResolutionStatus.UNRESOLVED)
+
+    def test_employer_specific_radio_requires_application_scoped_answer(self):
+        data = profile_data()
+        data["qa_bank"]["employment.previously_worked_here"] = {
+            "answer": False, "scope": "application", "application_id": "application-1"}
+        resolver = DeterministicAnswerResolver(CandidateProfile.from_mapping(data))
+        observed = question("Have you previously worked here?", control=ControlType.CHOICE,
+                            options=("Yes", "No"))
+        self.assertEqual(resolver.resolve(observed, "application-1").answer.value, "No")
+        self.assertEqual(resolver.resolve(observed, "another-application").status,
+                         ResolutionStatus.REQUIRES_REVIEW)
+
+
 class CanonicalizerTests(unittest.TestCase):
     def setUp(self):
         self.canonicalizer = SemanticCanonicalizer()
@@ -211,6 +235,20 @@ class ResolverTests(unittest.TestCase):
         self.assertEqual(DeterministicAnswerResolver(CandidateProfile.from_mapping(data))
                          .resolve(question("Gender", options=options), "A").status,
                          ResolutionStatus.UNRESOLVED)
+
+    def test_referral_source_requires_configured_answer_and_exact_live_option(self):
+        data = profile_data()
+        data["qa_bank"]["how_did_you_hear_about_us"] = {"answer": "Employee Referral"}
+        resolver = DeterministicAnswerResolver(CandidateProfile.from_mapping(data))
+        matched = resolver.resolve(question("How Did You Hear About Us?", control=ControlType.CHOICE,
+                                            options=("Employee Referral", "Job Board")), "A")
+        self.assertEqual(matched.status, ResolutionStatus.SAFE_TO_FILL)
+        self.assertEqual(matched.canonical.semantic_key, "how_did_you_hear_about_us")
+        self.assertEqual(matched.answer.source, AnswerSource.QA_BANK)
+        unmatched = resolver.resolve(question("How Did You Hear About Us?", control=ControlType.CHOICE,
+                                              options=("Website", "Job Board")), "A")
+        self.assertEqual(unmatched.status, ResolutionStatus.UNRESOLVED)
+        self.assertIsNone(unmatched.answer)
 
     def test_option_mapping_exact_only(self):
         yes_no = ("Yes", "No")

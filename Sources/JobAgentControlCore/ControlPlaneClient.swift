@@ -21,6 +21,8 @@ public enum ControlClientError: Error, LocalizedError, Equatable, Sendable {
     case protocolMismatch
     case backend(BackendErrorDTO)
     case transport(String)
+    case diagnosticTimeout
+    case requestTimeout
 
     public var errorDescription: String? {
         switch self {
@@ -28,6 +30,8 @@ public enum ControlClientError: Error, LocalizedError, Equatable, Sendable {
         case .protocolMismatch: "Backend response did not match the request."
         case .backend(let error): "\(error.code): \(error.message)"
         case .transport(let message): message
+        case .diagnosticTimeout: "Diagnostic observation timed out. Try again when the managed page is available."
+        case .requestTimeout: "The backend did not respond in time. Check the application state, then try again."
         }
     }
 }

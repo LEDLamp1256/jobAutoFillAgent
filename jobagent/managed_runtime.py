@@ -24,6 +24,7 @@ class _Window:
     opened_url: str | None = None
     page_token: str | None = None
     available: bool = True
+    closed: bool = False
 
 
 class _Session:
@@ -39,22 +40,35 @@ class _Session:
     async def _serve(self) -> None:
         # AnyIO's MCP context must be entered, used, and exited in one task.
         while True:
-            coroutine, result = await self.queue.get()
+            coroutine, result, settled = await self.queue.get()
             if coroutine is None:
                 result.set_result(None)
+                settled.set()
                 return
+            operation = asyncio.create_task(coroutine)
+            result.add_done_callback(lambda done, active=operation: self.loop.call_soon_threadsafe(active.cancel)
+                                     if done.cancelled() else None)
             try:
-                result.set_result(await coroutine)
+                value = await operation
             except BaseException as error:
-                result.set_exception(error)
+                if not result.done():
+                    result.set_exception(error)
+            else:
+                if not result.done():
+                    result.set_result(value)
+            finally:
+                settled.set()
 
-    def run(self, coroutine):
+    def run(self, coroutine, *, timeout: float = 45):
         future = concurrent.futures.Future()
-        self.loop.call_soon_threadsafe(self.queue.put_nowait, (coroutine, future))
+        settled = threading.Event()
+        self.loop.call_soon_threadsafe(self.queue.put_nowait, (coroutine, future, settled))
         try:
-            return future.result(timeout=45)
+            return future.result(timeout=timeout)
         except concurrent.futures.TimeoutError:
             future.cancel()
+            if not settled.wait(2):
+                raise RuntimeError("managed browser cancellation did not settle") from None
             raise RuntimeError("managed browser operation timed out") from None
 
     def close(self) -> None:
@@ -105,15 +119,27 @@ class MCPManagedWindows:
             tabs = window.session.run(window.browser.managed_tabs())
             if not self._one_tab(tabs):
                 window.available = False
+                window.closed = not re.findall(r"(?m)^\s*-\s*(\d+):", tabs)
                 return False
             if (window.page_token is not None and not
                     window.session.run(window.browser.managed_page_token_matches(window.page_token))):
                 window.available = False
+                window.closed = "about:blank" in tabs.casefold()
                 return False
             return True
-        except Exception:
+        except Exception as exc:
             window.available = False
+            # A dead page/server may be reopened from the durable URL. Other
+            # failures remain ambiguous and require human inspection.
+            detail = str(exc).casefold()
+            window.closed = any(token in detail for token in (
+                "browser has been closed", "target page, context or browser has been closed",
+                "connection closed", "transport closed"))
             return False
+
+    def recoverable_closed(self, window_id: str) -> bool:
+        window = self._windows.get(window_id)
+        return bool(window and window.closed)
 
     def allocate(self, task_id: str) -> str:
         existing = self._by_task.get(task_id)

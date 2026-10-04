@@ -1,0 +1,44 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Custom controls fixture</title></head>
+<body><main><h2 id="heading">Applicant Information</h2><div id="page">
+  <label>First Name * <input required id="first"></label>
+  <label>Last Name * <input required id="last"></label>
+  <label>Address Line 1 * <input required id="street"></label>
+  <label>City * <input required id="city"></label>
+  <label>Postal Code * <input required id="postal"></label>
+  <label>Phone Number * <input required id="phone"></label>
+  <div role="group" aria-label="Phone Device Type" aria-required="true">
+    <label>Phone Device Type *</label><button type="button">Mobile</button>
+  </div>
+  <div role="group" aria-label="Country / Territory Phone Code" aria-required="true">
+    <label for="code-search">Country / Territory Phone Code *</label>
+    <div><div class="selected-value" id="phone-token">United States of America (+1)
+      <button type="button" aria-label="Remove selected phone code" onclick="document.getElementById('phone-token').remove()">x</button>
+    </div><input id="code-search" role="combobox" value="" placeholder="Search">
+    <button type="button" aria-haspopup="listbox" onclick="document.getElementById('code-options').hidden=false">Open phone codes</button>
+    <div id="code-options" role="listbox" hidden><div role="option">Afghanistan (+93)</div></div></div>
+  </div>
+  <div role="group" aria-label="State" aria-required="true" aria-hidden="true">
+    <label>State *</label><button type="button" id="state-button" aria-haspopup="listbox"
+      onclick="document.getElementById('state-options').hidden=false">Select One</button>
+    <div id="state-options" role="listbox" hidden>
+      <div role="option" onclick="document.getElementById('state-button').textContent=this.textContent;this.parentElement.hidden=true">California</div>
+      <div role="option" onclick="document.getElementById('state-button').textContent=this.textContent;this.parentElement.hidden=true">Colorado</div>
+    </div>
+  </div>
+  <div role="group" aria-label="How Did You Hear About Us?" aria-required="true">
+    <label for="source-search">How Did You Hear About Us? *</label>
+    <input id="source-search" role="combobox" aria-autocomplete="list" aria-controls="source-options" placeholder="Search"
+      oninput="document.getElementById('source-options').hidden=false">
+    <button type="button" aria-haspopup="listbox" onclick="document.getElementById('source-options').hidden=false">Open sources</button>
+    <div id="source-selected" aria-label="items selected"></div>
+    <div id="source-options" role="listbox" hidden>
+      <div role="option" onclick="document.getElementById('source-selected').innerHTML='<span role=option aria-selected=true>LinkedIn</span>';document.getElementById('source-search').value='';this.parentElement.hidden=true">LinkedIn</div>
+      <div role="option">LinkedIn Recruiter</div><div role="option">LinkedIn referral</div>
+    </div>
+  </div>
+  <fieldset><legend>Have you previously worked for or are you currently working for Workday as an employee or contractor? *</legend>
+    <label><input type="radio" name="prior" value="Yes">Yes</label>
+    <label><input type="radio" name="prior" value="No">No</label>
+  </fieldset>
+  <button type="button" id="continue" onclick="window.advanceCount=(window.advanceCount||0)+1;document.getElementById('page').innerHTML='<h2>Next Page</h2><button type=button id=final-submit>Submit Application</button>'">Save and Continue</button>
+</div></main></body></html>

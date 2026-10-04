@@ -1,0 +1,36 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Sectioned choices fixture</title></head>
+<body><main><h1>Application</h1>
+<div role="group" aria-label="Phone">
+  <button type="button" aria-expanded="true">Phone</button>
+  <div aria-hidden="true"><label id="device-label">Phone Device Type *</label>
+    <div role="button" tabindex="0" aria-labelledby="device-label" aria-required="true">Mobile</div>
+  </div>
+  <div><label for="phone-code">Country / Territory Phone Code *</label>
+    <input id="phone-code" role="combobox" aria-required="true" value="" placeholder="Select One">
+    <div aria-label="items selected"><span role="option" aria-selected="true">Exampleland (+9)
+      <button type="button" aria-label="Remove selection">x</button></span></div>
+  </div>
+  <label>Phone Number * <input type="tel" value="5550100" required></label>
+  <label>Phone Extension <input type="text"></label>
+</div>
+<div role="group" aria-label="Address">
+  <button type="button" aria-expanded="true">Address</button>
+  <label>Address Line 1 <input type="text"></label>
+  <label>City * <input type="text" value="Example City" required></label>
+  <div aria-hidden="true"><label id="state-label">State *</label>
+    <div role="button" tabindex="0" aria-labelledby="state-label" aria-required="true" id="state-choice">California</div>
+  </div>
+  <label>Postal Code <input type="text"></label>
+</div>
+<div role="group" aria-label="How Did You Hear About Us?" aria-required="true">
+  <label for="referral">How Did You Hear About Us? *</label>
+  <input id="referral" role="combobox" aria-controls="referral-selected" value="">
+  <div id="referral-selected" aria-label="items selected"><span role="option" aria-selected="true">Example source</span></div>
+</div>
+<label>I have a preferred name <input type="checkbox" value="on"></label>
+<fieldset><legend>Previously worked here? *</legend>
+  <label><input type="radio" name="prior" value="Yes">Yes</label>
+  <label><input type="radio" name="prior" value="No" checked>No</label>
+</fieldset>
+<button type="button">Save and Continue</button><button type="button">Submit Application</button>
+</main></body></html>
